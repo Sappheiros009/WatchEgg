@@ -1,0 +1,694 @@
+using System;
+using BepInEx.Logging;
+using HarmonyLib;
+using Photon.Pun;
+using UnityEngine;
+
+namespace Sapphire009.WatchEgg
+{
+    /// <summary>
+    /// PEAK의 Big Egg 실제 프리팹인 NestEgg 전용 타이머입니다.
+    ///
+    /// 한 플레이어가 NestEgg를 20초 동안 연속으로 들고 있으면
+    /// 원본 CharacterItems.DropItemRpc를 통해 자동으로 떨어뜨립니다.
+    ///
+    /// 달걀을 떨어뜨리거나 던진 플레이어는 달걀이 공중에 있는 동안
+    /// 자신이 던진 달걀을 다시 잡을 수 없습니다.
+    ///
+    /// 달걀이 바닥이나 안정된 물체에 접촉한 뒤에는
+    /// 원래 던진 플레이어도 다시 집을 수 있습니다.
+    ///
+    /// Developer: Sapphire009
+    /// File: Timer.cs
+    /// </summary>
+    [DisallowMultipleComponent]
+    public sealed class Timer : MonoBehaviour
+    {
+        public const string DeveloperName =
+            "Sapphire009";
+
+        public const string TargetPrefabName =
+            "NestEgg";
+
+        /// <summary>
+        /// 한 플레이어가 달걀을 연속으로 들 수 있는 시간입니다.
+        /// </summary>
+        public const float MaximumHoldTime =
+            20f;
+
+        /// <summary>
+        /// 생성 직후 플레이어 몸이나 손과 겹친 것을
+        /// 바닥 접촉으로 잘못 판정하지 않도록 하는 시간입니다.
+        /// </summary>
+        private const float MinimumAirborneTime =
+            0.15f;
+
+        /// <summary>
+        /// 접촉면이 이 값 이상 위쪽을 바라보면
+        /// 바닥 또는 안정된 물체로 판정합니다.
+        /// </summary>
+        private const float MinimumGroundNormalY =
+            0.35f;
+
+        private const string LogPrefix =
+            "[Timer] ";
+
+        private static readonly ManualLogSource Logger =
+            BepInEx.Logging.Logger.CreateLogSource(
+                "WatchEgg.Timer");
+
+        private Item item;
+
+        private float heldTime;
+        private bool wasHeldByLocalPlayer;
+        private bool automaticDropRequested;
+
+        /*
+         * 원래 던진 플레이어의 PhotonView ViewID입니다.
+         */
+        private int blockedThrowerViewId = -1;
+
+        /*
+         * true인 동안 원래 던진 플레이어의 공중 재수령을 막습니다.
+         */
+        private bool blockThrowerPickupUntilGrounded;
+
+        private float airborneBlockStartTime;
+
+        /// <summary>
+        /// 현재 로컬 플레이어의 연속 소지 시간입니다.
+        /// TimerSound.cs에서 사용합니다.
+        /// </summary>
+        public float HeldTime
+        {
+            get
+            {
+                return heldTime;
+            }
+        }
+
+        /// <summary>
+        /// 자동 드롭까지 남은 시간입니다.
+        /// TimerSound.cs에서 사용합니다.
+        /// </summary>
+        public float RemainingTime
+        {
+            get
+            {
+                return Mathf.Max(
+                    0f,
+                    MaximumHoldTime - heldTime);
+            }
+        }
+
+        /// <summary>
+        /// 현재 원래 던진 플레이어의
+        /// 공중 재수령이 차단된 상태인지 나타냅니다.
+        /// </summary>
+        public bool IsThrowerPickupBlocked
+        {
+            get
+            {
+                return blockThrowerPickupUntilGrounded;
+            }
+        }
+
+        private void Awake()
+        {
+            item = GetComponent<Item>();
+
+            if (!IsNestEgg(item))
+            {
+                enabled = false;
+                return;
+            }
+
+            Logger.LogInfo(
+                LogPrefix +
+                "Timer attached to " +
+                item.gameObject.name);
+        }
+
+        private void Update()
+        {
+            if (item == null)
+            {
+                return;
+            }
+
+            UpdateLocalHoldTimer();
+        }
+
+        /// <summary>
+        /// 로컬 플레이어가 이 NestEgg를 들고 있는 동안
+        /// 20초 타이머를 진행합니다.
+        /// </summary>
+        private void UpdateLocalHoldTimer()
+        {
+            Character localCharacter =
+                Character.localCharacter;
+
+            bool isHeldByLocalPlayer =
+                localCharacter != null &&
+                localCharacter.data != null &&
+                localCharacter.IsLocal &&
+                localCharacter.data.currentItem == item &&
+                item.itemState == ItemState.Held;
+
+            if (!isHeldByLocalPlayer)
+            {
+                ResetHoldTimer();
+                return;
+            }
+
+            if (!wasHeldByLocalPlayer)
+            {
+                wasHeldByLocalPlayer = true;
+                heldTime = 0f;
+                automaticDropRequested = false;
+
+                Logger.LogInfo(
+                    LogPrefix +
+                    "NestEgg hold timer started.");
+            }
+
+            if (automaticDropRequested)
+            {
+                return;
+            }
+
+            heldTime += Time.deltaTime;
+
+            if (heldTime < MaximumHoldTime)
+            {
+                return;
+            }
+
+            RequestAutomaticDrop(
+                localCharacter);
+        }
+
+        /// <summary>
+        /// 20초가 지나면 PEAK 원본 DropItemRpc를 호출합니다.
+        /// 던지는 힘은 0으로 설정하여 손에서 아래로 떨어지게 합니다.
+        /// </summary>
+        private void RequestAutomaticDrop(
+            Character holder)
+        {
+            if (holder == null ||
+                holder.data == null ||
+                holder.refs == null ||
+                holder.refs.items == null ||
+                holder.player == null)
+            {
+                Logger.LogError(
+                    LogPrefix +
+                    "Automatic drop failed: " +
+                    "holder reference is missing.");
+
+                return;
+            }
+
+            if (holder.data.currentItem != item)
+            {
+                Logger.LogWarning(
+                    LogPrefix +
+                    "Automatic drop cancelled: " +
+                    "NestEgg is no longer held.");
+
+                ResetHoldTimer();
+                return;
+            }
+
+            CharacterItems characterItems =
+                holder.refs.items;
+
+            if (characterItems.currentSelectedSlot.IsNone)
+            {
+                Logger.LogError(
+                    LogPrefix +
+                    "Automatic drop failed: " +
+                    "currentSelectedSlot is None.");
+
+                return;
+            }
+
+            byte currentSlotId =
+                characterItems.currentSelectedSlot.Value;
+
+            ItemSlot currentSlot =
+                holder.player.GetItemSlot(
+                    currentSlotId);
+
+            if (currentSlot == null ||
+                currentSlot.IsEmpty())
+            {
+                Logger.LogError(
+                    LogPrefix +
+                    "Automatic drop failed: " +
+                    "current ItemSlot is null or empty.");
+
+                return;
+            }
+
+            string slotPrefabName =
+                NormalizePrefabName(
+                    currentSlot.GetPrefabName());
+
+            if (!IsNestEggName(
+                    slotPrefabName))
+            {
+                Logger.LogError(
+                    LogPrefix +
+                    "Automatic drop failed: " +
+                    "slot prefab is not NestEgg. " +
+                    "Prefab=" +
+                    slotPrefabName);
+
+                return;
+            }
+
+            PhotonView characterItemsView =
+                characterItems.GetComponent<PhotonView>();
+
+            if (characterItemsView == null)
+            {
+                Logger.LogError(
+                    LogPrefix +
+                    "Automatic drop failed: " +
+                    "CharacterItems PhotonView is null.");
+
+                return;
+            }
+
+            automaticDropRequested = true;
+
+            Vector3 spawnPosition =
+                item.transform.position +
+                Vector3.down * 0.2f;
+
+            Vector3 dropVelocity =
+                Vector3.zero;
+
+            Quaternion spawnRotation =
+                item.transform.rotation;
+
+            /*
+             * 원본 DropItemRpc 매개변수:
+             *
+             * throwCharge
+             * slotID
+             * spawnPos
+             * velocity
+             * rotation
+             * itemInstanceData
+             * cacheToDroppedItems
+             */
+            characterItemsView.RPC(
+                nameof(CharacterItems.DropItemRpc),
+                RpcTarget.All,
+                new object[]
+                {
+                    0f,
+                    currentSlotId,
+                    spawnPosition,
+                    dropVelocity,
+                    spawnRotation,
+                    currentSlot.data,
+                    false
+                });
+
+            Logger.LogWarning(
+                LogPrefix +
+                "NestEgg automatically dropped " +
+                "after 20 seconds.");
+        }
+
+        /// <summary>
+        /// 달걀을 놓거나 다른 플레이어에게 넘기면
+        /// 현재 플레이어의 소지 시간을 초기화합니다.
+        /// </summary>
+        private void ResetHoldTimer()
+        {
+            if (!wasHeldByLocalPlayer &&
+                heldTime <= 0f &&
+                !automaticDropRequested)
+            {
+                return;
+            }
+
+            wasHeldByLocalPlayer = false;
+            heldTime = 0f;
+            automaticDropRequested = false;
+        }
+
+        /// <summary>
+        /// 새로 생성된 지상 NestEgg에
+        /// 원래 던진 플레이어 정보를 설정합니다.
+        /// </summary>
+        private void ArmThrowerPickupBlock(
+            int throwerCharacterViewId)
+        {
+            if (throwerCharacterViewId <= 0)
+            {
+                return;
+            }
+
+            blockedThrowerViewId =
+                throwerCharacterViewId;
+
+            blockThrowerPickupUntilGrounded =
+                true;
+
+            airborneBlockStartTime =
+                Time.time;
+
+            Logger.LogInfo(
+                LogPrefix +
+                "Air catch blocked for thrower." +
+                " | ThrowerViewID=" +
+                blockedThrowerViewId);
+        }
+
+        /// <summary>
+        /// Item.Interact Prefix에서 호출됩니다.
+        ///
+        /// 원래 던진 플레이어만 차단하며
+        /// 다른 플레이어는 공중에서 달걀을 받을 수 있습니다.
+        /// </summary>
+        private bool CanInteract(
+            Character interactor)
+        {
+            if (!blockThrowerPickupUntilGrounded)
+            {
+                return true;
+            }
+
+            if (interactor == null)
+            {
+                return true;
+            }
+
+            PhotonView interactorView =
+                interactor.GetComponent<PhotonView>();
+
+            if (interactorView == null)
+            {
+                return true;
+            }
+
+            if (interactorView.ViewID !=
+                blockedThrowerViewId)
+            {
+                /*
+                 * 다른 플레이어가 공중에서 받는 것은 허용합니다.
+                 */
+                return true;
+            }
+
+            Logger.LogWarning(
+                LogPrefix +
+                "Thrower pickup blocked while NestEgg is airborne.");
+
+            return false;
+        }
+
+        private void OnCollisionEnter(
+            Collision collision)
+        {
+            CheckGroundContact(
+                collision);
+        }
+
+        private void OnCollisionStay(
+            Collision collision)
+        {
+            CheckGroundContact(
+                collision);
+        }
+
+        /// <summary>
+        /// 달걀이 플레이어가 아닌 바닥 또는 물체 위에 접촉했는지 검사합니다.
+        /// </summary>
+        private void CheckGroundContact(
+            Collision collision)
+        {
+            if (!blockThrowerPickupUntilGrounded ||
+                collision == null)
+            {
+                return;
+            }
+
+            if (Time.time -
+                airborneBlockStartTime <
+                MinimumAirborneTime)
+            {
+                return;
+            }
+
+            /*
+             * 플레이어 몸에 맞은 것을 착지로 처리하지 않습니다.
+             */
+            if (CollisionBelongsToCharacter(
+                    collision))
+            {
+                return;
+            }
+
+            for (int i = 0;
+                 i < collision.contactCount;
+                 i++)
+            {
+                ContactPoint contact =
+                    collision.GetContact(i);
+
+                if (contact.normal.y <
+                    MinimumGroundNormalY)
+                {
+                    continue;
+                }
+
+                MarkAsGrounded();
+                return;
+            }
+        }
+
+        /// <summary>
+        /// 충돌한 대상이 플레이어 또는 플레이어 신체인지 확인합니다.
+        /// </summary>
+        private static bool CollisionBelongsToCharacter(
+            Collision collision)
+        {
+            if (collision.collider != null)
+            {
+                Character colliderCharacter =
+                    collision.collider
+                        .GetComponentInParent<Character>();
+
+                if (colliderCharacter != null)
+                {
+                    return true;
+                }
+            }
+
+            if (collision.rigidbody != null)
+            {
+                Character rigidbodyCharacter =
+                    collision.rigidbody
+                        .GetComponentInParent<Character>();
+
+                if (rigidbodyCharacter != null)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 달걀이 바닥에 닿으면 원래 던진 플레이어의
+        /// 재수령 차단을 해제합니다.
+        /// </summary>
+        private void MarkAsGrounded()
+        {
+            if (!blockThrowerPickupUntilGrounded)
+            {
+                return;
+            }
+
+            blockThrowerPickupUntilGrounded =
+                false;
+
+            blockedThrowerViewId =
+                -1;
+
+            Logger.LogInfo(
+                LogPrefix +
+                "NestEgg touched the ground. " +
+                "The thrower can pick it up again.");
+        }
+
+        /// <summary>
+        /// Item 인스턴스 이름이 NestEgg인지 확인합니다.
+        /// </summary>
+        public static bool IsNestEgg(
+            Item targetItem)
+        {
+            if (targetItem == null)
+            {
+                return false;
+            }
+
+            return IsNestEggName(
+                targetItem.gameObject.name);
+        }
+
+        /// <summary>
+        /// 프리팹 이름이 NestEgg인지 확인합니다.
+        /// </summary>
+        public static bool IsNestEggName(
+            string objectName)
+        {
+            return string.Equals(
+                NormalizePrefabName(
+                    objectName),
+                TargetPrefabName,
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Unity가 생성 인스턴스 이름에 붙이는
+        /// (Clone) 접미사를 제거합니다.
+        /// </summary>
+        private static string NormalizePrefabName(
+            string objectName)
+        {
+            if (string.IsNullOrEmpty(
+                    objectName))
+            {
+                return string.Empty;
+            }
+
+            string normalized =
+                objectName.Trim();
+
+            const string cloneSuffix =
+                "(Clone)";
+
+            while (normalized.EndsWith(
+                       cloneSuffix,
+                       StringComparison.OrdinalIgnoreCase))
+            {
+                normalized =
+                    normalized.Substring(
+                        0,
+                        normalized.Length -
+                        cloneSuffix.Length)
+                    .Trim();
+            }
+
+            return normalized;
+        }
+
+        /// <summary>
+        /// 모든 NestEgg 인스턴스에 Timer를 자동 부착합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            "Awake")]
+        private static class ItemAwakePatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(
+                Item __instance)
+            {
+                if (!IsNestEgg(
+                        __instance))
+                {
+                    return;
+                }
+
+                if (__instance.GetComponent<Timer>() !=
+                    null)
+                {
+                    return;
+                }
+
+                __instance.gameObject
+                    .AddComponent<Timer>();
+            }
+        }
+
+        /// <summary>
+        /// 원본 DropItemRpc가 생성한 새 지상 아이템에
+        /// 던진 플레이어 정보가 전달된 직후 실행됩니다.
+        ///
+        /// 별도의 생성 아이템 검색이나 위치 매칭이 필요 없습니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            nameof(Item.RPC_SetThrownData))]
+        private static class SetThrownDataPatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(
+                Item __instance,
+                int characterID,
+                float thrownAmount)
+            {
+                if (!IsNestEgg(
+                        __instance))
+                {
+                    return;
+                }
+
+                Timer timer =
+                    __instance.GetComponent<Timer>();
+
+                if (timer == null)
+                {
+                    timer =
+                        __instance.gameObject
+                            .AddComponent<Timer>();
+                }
+
+                timer.ArmThrowerPickupBlock(
+                    characterID);
+            }
+        }
+
+        /// <summary>
+        /// 원래 던진 플레이어가 공중에 있는 NestEgg를
+        /// 다시 집으려 할 때 Item.Interact 실행을 막습니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            nameof(Item.Interact))]
+        private static class ItemInteractPatch
+        {
+            [HarmonyPrefix]
+            private static bool Prefix(
+                Item __instance,
+                Character interactor)
+            {
+                if (!IsNestEgg(
+                        __instance))
+                {
+                    return true;
+                }
+
+                Timer timer =
+                    __instance.GetComponent<Timer>();
+
+                if (timer == null)
+                {
+                    return true;
+                }
+
+                return timer.CanInteract(
+                    interactor);
+            }
+        }
+    }
+}
