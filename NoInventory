@@ -1,0 +1,1281 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using BepInEx.Logging;
+using HarmonyLib;
+using Photon.Pun;
+using UnityEngine;
+using Zorro.Core;
+
+namespace Sapphire009.WatchEgg
+{
+    /// <summary>
+    /// NestEgg는 반드시 플레이어의 손에 들려 있어야 합니다.
+    ///
+    /// 다음 상황에서는 달걀을 즉시 손이나 가방에서 분리한 뒤
+    /// 아래쪽으로 떨어뜨리는 위치에서 강제로 파손합니다.
+    ///
+    /// 1. 달걀을 들고 다른 인벤토리 칸을 선택한 경우
+    /// 2. 달걀이 0, 1, 2번 인벤토리 칸에 보관된 경우
+    /// 3. 달걀이 임시 인벤토리 칸 250에 보관된 경우
+    /// 4. 달걀을 장착형 가방 또는 바닥 가방에 넣은 경우
+    ///
+    /// 정상적으로 선택된 칸의 달걀을 실제 손에 들고 있는 동안에는
+    /// 파손하지 않습니다.
+    ///
+    /// Developer: Sapphire009
+    /// File: NoInventory.cs
+    /// </summary>
+    public static class NoInventory
+    {
+        private const string LogPrefix =
+            "[NoInventory] ";
+
+        private const string TargetPrefabName =
+            "NestEgg";
+
+        /*
+         * 인벤토리의 달걀을 강제로 손에 생성한 직후에는
+         * 손 고정 조인트가 만들어질 시간을 아주 잠깐 기다립니다.
+         */
+        private const float HeldAttachSafetyDelay =
+            0.06f;
+
+        /*
+         * 정상적인 달걀 획득 직후 EquipSlot 코루틴이
+         * 완료되기 전에 잘못된 보관 상태로 오인하지 않도록
+         * 짧은 유예 시간을 둡니다.
+         */
+        private const float NormalEquipGraceSeconds =
+            0.75f;
+
+        private const float PendingBreakTimeoutSeconds =
+            3f;
+
+        private const float EquipRetryIntervalSeconds =
+            0.20f;
+
+        private const float BackpackScanIntervalSeconds =
+            0.10f;
+
+        private const int MaximumLogCount =
+            100;
+
+        private static readonly ManualLogSource Logger =
+            BepInEx.Logging.Logger.CreateLogSource(
+                "WatchEgg.NoInventory");
+
+        /*
+         * 인벤토리 데이터에만 남아 있는 달걀은
+         * 실제 Item 오브젝트가 존재하지 않을 수 있습니다.
+         *
+         * 해당 칸을 잠깐 장착하여 실제 Item을 생성한 뒤
+         * 곧바로 파손하기 위한 상태입니다.
+         */
+        private static readonly Dictionary<int, PendingSlotBreak>
+            PendingSlotBreaks =
+                new Dictionary<int, PendingSlotBreak>();
+
+        /*
+         * 동일한 달걀에 여러 파손 경로가 동시에 실행되는 것을
+         * 방지합니다.
+         */
+        private static readonly HashSet<int>
+            BreakingEggInstanceIds =
+                new HashSet<int>();
+
+        private static float nextBackpackScanAt;
+
+        private static int inventoryBreakLogCount;
+        private static int backpackBreakLogCount;
+        private static int rejectedBreakLogCount;
+
+        private sealed class PendingSlotBreak
+        {
+            public byte SlotId;
+
+            public float StartedAt;
+
+            public float NextEquipAttemptAt;
+
+            public float HeldDetectedAt = -1f;
+        }
+
+        /// <summary>
+        /// Item이 WatchEgg 대상 NestEgg인지 확인합니다.
+        /// </summary>
+        private static bool IsNestEgg(
+            Item item)
+        {
+            if (item == null)
+            {
+                return false;
+            }
+
+            string objectName =
+                NormalizeObjectName(
+                    item.gameObject.name);
+
+            return string.Equals(
+                objectName,
+                TargetPrefabName,
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool SlotContainsNestEgg(
+            ItemSlot slot)
+        {
+            return
+                slot != null &&
+                !slot.IsEmpty() &&
+                IsNestEgg(slot.prefab);
+        }
+
+        private static string NormalizeObjectName(
+            string objectName)
+        {
+            if (string.IsNullOrWhiteSpace(
+                    objectName))
+            {
+                return string.Empty;
+            }
+
+            string normalizedName =
+                objectName.Trim();
+
+            const string cloneSuffix =
+                "(Clone)";
+
+            if (normalizedName.EndsWith(
+                    cloneSuffix,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                normalizedName =
+                    normalizedName.Substring(
+                        0,
+                        normalizedName.Length -
+                        cloneSuffix.Length);
+
+                normalizedName =
+                    normalizedName.Trim();
+            }
+
+            return normalizedName;
+        }
+
+        private static Character ResolveCharacter(
+            CharacterItems items)
+        {
+            if (items == null)
+            {
+                return null;
+            }
+
+            Character character =
+                items.GetComponent<Character>();
+
+            if (character == null)
+            {
+                character =
+                    items.GetComponentInParent<Character>();
+            }
+
+            return character;
+        }
+
+        private static bool IsValidLocalCharacter(
+            Character character)
+        {
+            return
+                character != null &&
+                character.IsLocal &&
+                character.data != null &&
+                character.player != null;
+        }
+
+        /// <summary>
+        /// 해당 인벤토리 칸의 달걀이 실제로 손에 들린 상태인지
+        /// 확인합니다.
+        ///
+        /// 선택된 칸에 달걀 데이터가 존재하는 것만으로는 부족하며,
+        /// CharacterData.currentItem도 NestEgg이고 Held 상태여야 합니다.
+        /// </summary>
+        private static bool IsEggLegallyHeldFromSlot(
+            CharacterItems items,
+            Character character,
+            byte slotId)
+        {
+            if (items == null ||
+                character == null ||
+                character.data == null)
+            {
+                return false;
+            }
+
+            if (!items.currentSelectedSlot.IsSome ||
+                items.currentSelectedSlot.Value != slotId)
+            {
+                return false;
+            }
+
+            Item heldItem =
+                character.data.currentItem;
+
+            return
+                IsNestEgg(heldItem) &&
+                heldItem.itemState ==
+                ItemState.Held;
+        }
+
+        /// <summary>
+        /// 정상적인 획득이나 직접 슬롯 선택으로 달걀이
+        /// 손에 생성되는 도중인지 확인합니다.
+        /// </summary>
+        private static bool IsRecentNormalEquip(
+            CharacterItems items,
+            byte slotId)
+        {
+            if (items == null ||
+                !items.lastSelectedSlot.IsSome ||
+                items.lastSelectedSlot.Value != slotId)
+            {
+                return false;
+            }
+
+            return
+                Time.time -
+                items.lastEquippedSlotTime <
+                NormalEquipGraceSeconds;
+        }
+
+        private static Optionable<byte>
+            FindHeldEggBackingSlot(
+                CharacterItems items,
+                Character character)
+        {
+            if (items == null ||
+                character == null ||
+                character.player == null)
+            {
+                return Optionable<byte>.None;
+            }
+
+            if (items.currentSelectedSlot.IsSome)
+            {
+                byte selectedSlotId =
+                    items.currentSelectedSlot.Value;
+
+                ItemSlot selectedSlot =
+                    character.player.GetItemSlot(
+                        selectedSlotId);
+
+                if (SlotContainsNestEgg(
+                        selectedSlot))
+                {
+                    return Optionable<byte>.Some(
+                        selectedSlotId);
+                }
+            }
+
+            ItemSlot[] normalSlots =
+                character.player.itemSlots;
+
+            if (normalSlots != null)
+            {
+                for (byte slotId = 0;
+                     slotId < normalSlots.Length;
+                     slotId++)
+                {
+                    if (SlotContainsNestEgg(
+                            normalSlots[slotId]))
+                    {
+                        return Optionable<byte>.Some(
+                            slotId);
+                    }
+                }
+            }
+
+            if (SlotContainsNestEgg(
+                    character.player.tempFullSlot))
+            {
+                return Optionable<byte>.Some(
+                    250);
+            }
+
+            return Optionable<byte>.None;
+        }
+
+        /// <summary>
+        /// 손에 들지 않은 NestEgg가 일반 인벤토리나
+        /// 임시 인벤토리에 있는지 검사합니다.
+        /// </summary>
+        private static bool TryFindIllegalEggSlot(
+            CharacterItems items,
+            Character character,
+            out byte illegalSlotId)
+        {
+            illegalSlotId =
+                0;
+
+            if (items == null ||
+                character == null ||
+                character.player == null)
+            {
+                return false;
+            }
+
+            ItemSlot[] normalSlots =
+                character.player.itemSlots;
+
+            if (normalSlots != null)
+            {
+                for (byte slotId = 0;
+                     slotId < normalSlots.Length;
+                     slotId++)
+                {
+                    ItemSlot slot =
+                        normalSlots[slotId];
+
+                    if (!SlotContainsNestEgg(
+                            slot))
+                    {
+                        continue;
+                    }
+
+                    if (IsEggLegallyHeldFromSlot(
+                            items,
+                            character,
+                            slotId))
+                    {
+                        continue;
+                    }
+
+                    if (IsRecentNormalEquip(
+                            items,
+                            slotId))
+                    {
+                        continue;
+                    }
+
+                    illegalSlotId =
+                        slotId;
+
+                    return true;
+                }
+            }
+
+            const byte temporarySlotId =
+                250;
+
+            if (SlotContainsNestEgg(
+                    character.player.tempFullSlot) &&
+                !IsEggLegallyHeldFromSlot(
+                    items,
+                    character,
+                    temporarySlotId) &&
+                !IsRecentNormalEquip(
+                    items,
+                    temporarySlotId))
+            {
+                illegalSlotId =
+                    temporarySlotId;
+
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 로컬 클라이언트가 해당 달걀의 파손 권한을
+        /// 가지고 있는지 확인합니다.
+        ///
+        /// PEAK 원본 Breakable 충돌 파손도
+        /// PhotonView.IsMine인 클라이언트에서만 실행됩니다.
+        /// </summary>
+        private static bool CanBreakLocally(
+            Item egg)
+        {
+            if (egg == null)
+            {
+                return false;
+            }
+
+            if (!PhotonNetwork.InRoom ||
+                egg.photonView == null)
+            {
+                return true;
+            }
+
+            return egg.photonView.IsMine;
+        }
+
+        /// <summary>
+        /// Held 또는 InBackpack 상태의 달걀을
+        /// Ground 상태와 같은 물리 설정으로 전환합니다.
+        ///
+        /// Item.SetState는 게임 DLL 내부 메서드이므로
+        /// Reflection 없이 필요한 공개 필드만 직접 설정합니다.
+        /// </summary>
+        private static void PrepareEggForForcedBreak(
+            Item egg,
+            Vector3 dropPosition)
+        {
+            if (egg == null)
+            {
+                return;
+            }
+
+            egg.transform.SetParent(
+                null,
+                true);
+
+            egg.transform.position =
+                dropPosition;
+
+            egg.itemState =
+                ItemState.Ground;
+
+            egg.holderCharacter =
+                null;
+
+            egg.backpackSlotTransform =
+                null;
+
+            egg.backpackReference =
+                Optionable<
+                    ValueTuple<byte, BackpackReference>
+                >.None;
+
+            if (egg.rig != null)
+            {
+                egg.rig.position =
+                    dropPosition;
+
+                egg.rig.useGravity =
+                    true;
+
+                egg.rig.isKinematic =
+                    false;
+
+                egg.rig.interpolation =
+                    RigidbodyInterpolation.Interpolate;
+
+                egg.rig.collisionDetectionMode =
+                    CollisionDetectionMode.ContinuousDynamic;
+
+                egg.rig.excludeLayers =
+                    0;
+
+                egg.rig.linearVelocity =
+                    Vector3.down * 1.5f;
+
+                egg.rig.angularVelocity =
+                    new Vector3(
+                        1.5f,
+                        0.75f,
+                        -1f);
+            }
+
+            Collider[] colliders =
+                egg.colliders;
+
+            if (colliders == null ||
+                colliders.Length == 0)
+            {
+                colliders =
+                    egg.GetComponentsInChildren<Collider>(
+                        true);
+            }
+
+            for (int i = 0;
+                 i < colliders.Length;
+                 i++)
+            {
+                Collider collider =
+                    colliders[i];
+
+                if (collider == null)
+                {
+                    continue;
+                }
+
+                collider.enabled =
+                    true;
+
+                collider.isTrigger =
+                    false;
+            }
+
+            Renderer[] renderers =
+                egg.GetComponentsInChildren<Renderer>(
+                    true);
+
+            for (int i = 0;
+                 i < renderers.Length;
+                 i++)
+            {
+                if (renderers[i] != null)
+                {
+                    renderers[i].enabled =
+                        true;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Collision 없이 Break를 실행할 때 원본 Breakable이
+        /// Collision.contacts 또는 Collision.transform에
+        /// 접근하지 않도록 관련 옵션을 끕니다.
+        /// </summary>
+        private static bool ForceBreakEgg(
+            Item egg,
+            Vector3 dropPosition,
+            string reason)
+        {
+            if (!IsNestEgg(
+                    egg))
+            {
+                return false;
+            }
+
+            int eggInstanceId =
+                egg.GetInstanceID();
+
+            if (!BreakingEggInstanceIds.Add(
+                    eggInstanceId))
+            {
+                return false;
+            }
+
+            if (!CanBreakLocally(
+                    egg))
+            {
+                BreakingEggInstanceIds.Remove(
+                    eggInstanceId);
+
+                LogRejected(
+                    egg,
+                    reason,
+                    "Local client does not own the egg PhotonView.");
+
+                return false;
+            }
+
+            BreakableEgg breakableEgg =
+                egg.GetComponent<BreakableEgg>();
+
+            if (breakableEgg == null)
+            {
+                breakableEgg =
+                    egg.GetComponentInChildren<
+                        BreakableEgg>(
+                        true);
+            }
+
+            if (breakableEgg == null)
+            {
+                BreakingEggInstanceIds.Remove(
+                    eggInstanceId);
+
+                LogRejected(
+                    egg,
+                    reason,
+                    "BreakableEgg component was not found.");
+
+                return false;
+            }
+
+            try
+            {
+                PrepareEggForForcedBreak(
+                    egg,
+                    dropPosition);
+
+                /*
+                 * Break(null)이 안전하게 작동하도록 설정합니다.
+                 *
+                 * spawnsItemsKinematic이 true이면 원본 Break에서
+                 * coll.contacts[0]에 접근하므로 반드시 false로 둡니다.
+                 */
+                breakableEgg.spawnsItemsKinematic =
+                    false;
+
+                /*
+                 * ragdollCharacterOnBreak가 true이면
+                 * 원본 Break에서 coll.transform에 접근합니다.
+                 */
+                breakableEgg.ragdollCharacterOnBreak =
+                    false;
+
+                breakableEgg.Break(
+                    null);
+
+                Logger.LogWarning(
+                    LogPrefix +
+                    "NestEgg was forcibly broken." +
+                    " Reason=" +
+                    reason +
+                    " | Position=" +
+                    dropPosition +
+                    " | ViewID=" +
+                    (
+                        egg.photonView != null
+                            ? egg.photonView.ViewID.ToString()
+                            : "None"
+                    ));
+
+                return true;
+            }
+            catch (Exception exception)
+            {
+                BreakingEggInstanceIds.Remove(
+                    eggInstanceId);
+
+                Logger.LogError(
+                    LogPrefix +
+                    "Failed to forcibly break NestEgg." +
+                    " Reason=" +
+                    reason +
+                    " | Exception=" +
+                    exception);
+
+                return false;
+            }
+        }
+
+        private static Vector3 GetHandDropPosition(
+            Character character,
+            Item egg)
+        {
+            if (character == null)
+            {
+                return
+                    egg != null
+                        ? egg.transform.position
+                        : Vector3.zero;
+            }
+
+            Vector3 forward =
+                character.transform.forward;
+
+            if (character.data != null &&
+                character.data.lookDirection.sqrMagnitude >
+                0.001f)
+            {
+                forward =
+                    character.data.lookDirection.normalized;
+            }
+
+            return
+                character.Center +
+                forward * 0.30f +
+                Vector3.down * 0.15f;
+        }
+
+        private static Vector3 GetBackpackDropPosition(
+            Item egg,
+            BackpackReference backpackReference)
+        {
+            if (backpackReference.view != null)
+            {
+                Character backpackOwner =
+                    backpackReference.view
+                        .GetComponent<Character>();
+
+                if (backpackOwner != null)
+                {
+                    return
+                        backpackOwner.Center +
+                        backpackOwner.transform.forward *
+                        0.25f +
+                        Vector3.down *
+                        0.10f;
+                }
+
+                return
+                    backpackReference.view.transform.position +
+                    Vector3.up * 0.25f;
+            }
+
+            return
+                egg != null
+                    ? egg.transform.position +
+                      Vector3.down * 0.10f
+                    : Vector3.zero;
+        }
+
+        /// <summary>
+        /// 손에 들린 달걀의 인벤토리 데이터를 지우고,
+        /// 손 고정 상태를 해제한 뒤 즉시 파손합니다.
+        /// </summary>
+        private static void BreakHeldEgg(
+            CharacterItems items,
+            Optionable<byte> backingSlot,
+            Optionable<byte> slotToEquipAfterBreak,
+            string reason)
+        {
+            if (items == null)
+            {
+                return;
+            }
+
+            Character character =
+                ResolveCharacter(
+                    items);
+
+            if (!IsValidLocalCharacter(
+                    character))
+            {
+                return;
+            }
+
+            Item heldEgg =
+                character.data.currentItem;
+
+            if (!IsNestEgg(
+                    heldEgg))
+            {
+                return;
+            }
+
+            if (backingSlot.IsNone)
+            {
+                backingSlot =
+                    FindHeldEggBackingSlot(
+                        items,
+                        character);
+            }
+
+            if (backingSlot.IsSome)
+            {
+                ItemSlot slot =
+                    character.player.GetItemSlot(
+                        backingSlot.Value);
+
+                if (SlotContainsNestEgg(
+                        slot))
+                {
+                    character.player.EmptySlot(
+                        backingSlot);
+                }
+            }
+
+            Vector3 dropPosition =
+                GetHandDropPosition(
+                    character,
+                    heldEgg);
+
+            /*
+             * 달걀을 파괴하기 전에 손의 FixedJoint와
+             * currentItem 참조를 정리합니다.
+             */
+            items.UnAttachEquippedItem();
+
+            bool broken =
+                ForceBreakEgg(
+                    heldEgg,
+                    dropPosition,
+                    reason);
+
+            if (broken &&
+                inventoryBreakLogCount <
+                MaximumLogCount)
+            {
+                inventoryBreakLogCount++;
+
+                Logger.LogInfo(
+                    LogPrefix +
+                    "Inventory egg violation handled." +
+                    " Count=" +
+                    inventoryBreakLogCount +
+                    "/" +
+                    MaximumLogCount +
+                    " | Reason=" +
+                    reason +
+                    " | BackingSlot=" +
+                    (
+                        backingSlot.IsSome
+                            ? backingSlot.Value.ToString()
+                            : "None"
+                    ));
+            }
+
+            items.StartCoroutine(
+                ContinueEquipAfterBreak(
+                    items,
+                    slotToEquipAfterBreak));
+        }
+
+        private static IEnumerator ContinueEquipAfterBreak(
+            CharacterItems items,
+            Optionable<byte> requestedSlot)
+        {
+            /*
+             * PhotonNetwork.Destroy와 기존 장착 코루틴이
+             * 같은 프레임에 충돌하지 않도록 한 프레임 기다립니다.
+             */
+            yield return null;
+
+            if (items == null)
+            {
+                yield break;
+            }
+
+            Character character =
+                ResolveCharacter(
+                    items);
+
+            if (!IsValidLocalCharacter(
+                    character))
+            {
+                yield break;
+            }
+
+            items.EquipSlot(
+                requestedSlot);
+        }
+
+        /// <summary>
+        /// 인벤토리 데이터에만 존재하는 달걀을 잠깐 장착한 뒤
+        /// 실제 Item 인스턴스를 파손합니다.
+        /// </summary>
+        private static bool ProcessPendingSlotBreak(
+            CharacterItems items,
+            Character character)
+        {
+            int characterId =
+                character.GetInstanceID();
+
+            PendingSlotBreak pending;
+
+            if (!PendingSlotBreaks.TryGetValue(
+                    characterId,
+                    out pending))
+            {
+                return false;
+            }
+
+            if (Time.time -
+                pending.StartedAt >
+                PendingBreakTimeoutSeconds)
+            {
+                PendingSlotBreaks.Remove(
+                    characterId);
+
+                LogRejected(
+                    character.data.currentItem,
+                    "InventorySlot",
+                    "Timed out while equipping stored NestEgg.");
+
+                return false;
+            }
+
+            ItemSlot pendingSlot =
+                character.player.GetItemSlot(
+                    pending.SlotId);
+
+            if (!SlotContainsNestEgg(
+                    pendingSlot))
+            {
+                PendingSlotBreaks.Remove(
+                    characterId);
+
+                return false;
+            }
+
+            Item heldItem =
+                character.data.currentItem;
+
+            if (IsNestEgg(
+                    heldItem) &&
+                heldItem.itemState ==
+                ItemState.Held)
+            {
+                if (pending.HeldDetectedAt < 0f)
+                {
+                    pending.HeldDetectedAt =
+                        Time.time;
+
+                    return true;
+                }
+
+                if (Time.time -
+                    pending.HeldDetectedAt <
+                    HeldAttachSafetyDelay)
+                {
+                    return true;
+                }
+
+                byte pendingSlotId =
+                    pending.SlotId;
+
+                PendingSlotBreaks.Remove(
+                    characterId);
+
+                BreakHeldEgg(
+                    items,
+                    Optionable<byte>.Some(
+                        pendingSlotId),
+                    Optionable<byte>.None,
+                    "StoredInInventorySlot");
+
+                return true;
+            }
+
+            if (Time.time >=
+                pending.NextEquipAttemptAt)
+            {
+                pending.NextEquipAttemptAt =
+                    Time.time +
+                    EquipRetryIntervalSeconds;
+
+                items.EquipSlot(
+                    Optionable<byte>.Some(
+                        pending.SlotId));
+            }
+
+            return true;
+        }
+
+        private static void StartPendingSlotBreak(
+            CharacterItems items,
+            Character character,
+            byte slotId)
+        {
+            int characterId =
+                character.GetInstanceID();
+
+            if (PendingSlotBreaks.ContainsKey(
+                    characterId))
+            {
+                return;
+            }
+
+            PendingSlotBreak pending =
+                new PendingSlotBreak();
+
+            pending.SlotId =
+                slotId;
+
+            pending.StartedAt =
+                Time.time;
+
+            pending.NextEquipAttemptAt =
+                Time.time +
+                EquipRetryIntervalSeconds;
+
+            PendingSlotBreaks.Add(
+                characterId,
+                pending);
+
+            /*
+             * 먼저 해당 칸을 장착하여 실제 NestEgg Item을
+             * 생성하도록 PEAK 원본 장착 경로를 사용합니다.
+             */
+            items.EquipSlot(
+                Optionable<byte>.Some(
+                    slotId));
+        }
+
+        /// <summary>
+        /// 가방에 들어간 실제 NestEgg Item의 가방 데이터를 제거하고
+        /// 가방 바깥 위치에서 파손합니다.
+        /// </summary>
+        private static void BreakBackpackedEgg(
+            Item egg,
+            BackpackReference backpackReference,
+            string reason)
+        {
+            if (!IsNestEgg(
+                    egg) ||
+                egg.itemState !=
+                ItemState.InBackpack)
+            {
+                return;
+            }
+
+            if (!CanBreakLocally(
+                    egg))
+            {
+                return;
+            }
+
+            Vector3 dropPosition =
+                GetBackpackDropPosition(
+                    egg,
+                    backpackReference);
+
+            /*
+             * 가방 내부 ItemSlot 데이터를 먼저 비웁니다.
+             * 이 메서드는 장착형 가방과 바닥 가방 양쪽을
+             * 원본 네트워크 방식으로 동기화합니다.
+             */
+            egg.ClearDataFromBackpack();
+
+            bool broken =
+                ForceBreakEgg(
+                    egg,
+                    dropPosition,
+                    reason);
+
+            if (broken &&
+                backpackBreakLogCount <
+                MaximumLogCount)
+            {
+                backpackBreakLogCount++;
+
+                Logger.LogInfo(
+                    LogPrefix +
+                    "Backpack egg violation handled." +
+                    " Count=" +
+                    backpackBreakLogCount +
+                    "/" +
+                    MaximumLogCount +
+                    " | Reason=" +
+                    reason);
+            }
+        }
+
+        /// <summary>
+        /// 네트워크 동기화나 다른 모드로 인해 이미 가방에 들어간
+        /// NestEgg가 남는 상황을 주기적으로 정리합니다.
+        /// </summary>
+        private static void ScanWorldBackpackedEggs()
+        {
+            if (Time.time <
+                nextBackpackScanAt)
+            {
+                return;
+            }
+
+            nextBackpackScanAt =
+                Time.time +
+                BackpackScanIntervalSeconds;
+
+            List<Item> items =
+                new List<Item>(
+                    Item.ALL_ITEMS);
+
+            for (int i = 0;
+                 i < items.Count;
+                 i++)
+            {
+                Item item =
+                    items[i];
+
+                if (!IsNestEgg(
+                        item) ||
+                    item.itemState !=
+                    ItemState.InBackpack ||
+                    !item.backpackReference.IsSome)
+                {
+                    continue;
+                }
+
+                ValueTuple<byte, BackpackReference>
+                    backpackData =
+                        item.backpackReference.Value;
+
+                BreakBackpackedEgg(
+                    item,
+                    backpackData.Item2,
+                    "BackpackStateDetected");
+            }
+        }
+
+        private static void LogRejected(
+            Item egg,
+            string reason,
+            string detail)
+        {
+            if (rejectedBreakLogCount >=
+                MaximumLogCount)
+            {
+                return;
+            }
+
+            rejectedBreakLogCount++;
+
+            Logger.LogWarning(
+                LogPrefix +
+                "NestEgg break request was rejected." +
+                " Count=" +
+                rejectedBreakLogCount +
+                "/" +
+                MaximumLogCount +
+                " | Reason=" +
+                reason +
+                " | Detail=" +
+                detail +
+                " | Object=" +
+                (
+                    egg != null
+                        ? egg.gameObject.name
+                        : "null"
+                ));
+        }
+
+        /// <summary>
+        /// 달걀을 들고 다른 칸 또는 빈손을 선택하면
+        /// 원본 장착 변경을 잠시 막고 달걀부터 파손합니다.
+        ///
+        /// 달걀을 직접 던지는 DropItemRpc 경로는 패치하지 않으므로
+        /// 다른 플레이어에게 던져 주는 기능은 그대로 유지됩니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(CharacterItems),
+            nameof(CharacterItems.EquipSlot),
+            new Type[]
+            {
+                typeof(Optionable<byte>)
+            })]
+        private static class CharacterItemsEquipSlotPatch
+        {
+            [HarmonyPrefix]
+            private static bool Prefix(
+                CharacterItems __instance,
+                Optionable<byte> __0)
+            {
+                Character character =
+                    ResolveCharacter(
+                        __instance);
+
+                if (!IsValidLocalCharacter(
+                        character))
+                {
+                    return true;
+                }
+
+                Item heldItem =
+                    character.data.currentItem;
+
+                if (!IsNestEgg(
+                        heldItem) ||
+                    heldItem.itemState !=
+                    ItemState.Held)
+                {
+                    return true;
+                }
+
+                bool requestedSameSlot =
+                    __0.IsSome &&
+                    __instance.currentSelectedSlot.IsSome &&
+                    __0.Value ==
+                    __instance.currentSelectedSlot.Value;
+
+                if (requestedSameSlot)
+                {
+                    return true;
+                }
+
+                int characterId =
+                    character.GetInstanceID();
+
+                PendingSlotBreaks.Remove(
+                    characterId);
+
+                Optionable<byte> backingSlot =
+                    FindHeldEggBackingSlot(
+                        __instance,
+                        character);
+
+                BreakHeldEgg(
+                    __instance,
+                    backingSlot,
+                    __0,
+                    "EggLeftPlayerHand");
+
+                /*
+                 * 기존 EquipSlot은 실행하지 않습니다.
+                 * 달걀 파손 후 ContinueEquipAfterBreak에서
+                 * 요청한 슬롯을 다시 장착합니다.
+                 */
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 일반 인벤토리 0, 1, 2번 및 임시 슬롯 250을
+        /// 지속적으로 검사합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(CharacterItems),
+            "Update")]
+        private static class CharacterItemsUpdatePatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(
+                CharacterItems __instance)
+            {
+                Character character =
+                    ResolveCharacter(
+                        __instance);
+
+                if (!IsValidLocalCharacter(
+                        character))
+                {
+                    return;
+                }
+
+                ScanWorldBackpackedEggs();
+
+                if (ProcessPendingSlotBreak(
+                        __instance,
+                        character))
+                {
+                    return;
+                }
+
+                byte illegalSlotId;
+
+                if (!TryFindIllegalEggSlot(
+                        __instance,
+                        character,
+                        out illegalSlotId))
+                {
+                    return;
+                }
+
+                StartPendingSlotBreak(
+                    __instance,
+                    character,
+                    illegalSlotId);
+            }
+        }
+
+        /// <summary>
+        /// NestEgg가 가방 슬롯에 실제 배치된 직후 실행합니다.
+        /// 원본 처리로 backpackReference가 설정된 다음
+        /// 가방 데이터를 제거하고 달걀을 파손합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            nameof(Item.PutInBackpackRPC),
+            new Type[]
+            {
+                typeof(byte),
+                typeof(BackpackReference)
+            })]
+        private static class ItemPutInBackpackRpcPatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(
+                Item __instance,
+                byte __0,
+                BackpackReference __1)
+            {
+                if (!IsNestEgg(
+                        __instance))
+                {
+                    return;
+                }
+
+                BreakBackpackedEgg(
+                    __instance,
+                    __1,
+                    "PutInBackpackRPC");
+            }
+        }
+    }
+}
