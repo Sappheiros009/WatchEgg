@@ -1,0 +1,485 @@
+using System;
+using BepInEx.Logging;
+using HarmonyLib;
+using UnityEngine;
+using Zorro.Core;
+
+namespace Sapphire009.WatchEgg
+{
+    /// <summary>
+    /// PEAK의 Big Egg에 해당하는 실제 프리팹 NestEgg를 대상으로 합니다.
+    ///
+    /// NestEgg를 들고 다른 인벤토리 칸을 선택하면
+    /// canPocket을 false로 설정하여 PEAK 원본 DropItemRpc가
+    /// 실행되도록 합니다.
+    ///
+    /// Developer: Sapphire009
+    /// File: AutoDrop.cs
+    /// </summary>
+    [HarmonyPatch(
+        typeof(CharacterItems),
+        nameof(CharacterItems.EquipSlot))]
+    public static class AutoDrop
+    {
+        public const string DeveloperName =
+            "Sapphire009";
+
+        /// <summary>
+        /// 로그에서 확인한 Big Egg의 실제 프리팹 이름입니다.
+        /// </summary>
+        public const string TargetPrefabName =
+            "NestEgg";
+
+        private const string LogPrefix =
+            "[AutoDrop] ";
+
+        private static ManualLogSource logger;
+
+        /// <summary>
+        /// WatchEggPlugin에서 BepInEx Logger를 전달받습니다.
+        /// </summary>
+        public static void SetLogger(
+            ManualLogSource pluginLogger)
+        {
+            logger = pluginLogger;
+
+            LogInfo(
+                "AutoDrop initialized. " +
+                "Target prefab: " +
+                TargetPrefabName);
+        }
+
+        /// <summary>
+        /// Harmony가 EquipSlot 패치를 등록하는지 확인합니다.
+        /// </summary>
+        [HarmonyPrepare]
+        private static bool Prepare()
+        {
+            LogInfo(
+                "PATCH READY: " +
+                "CharacterItems.EquipSlot");
+
+            return true;
+        }
+
+        /// <summary>
+        /// 원본 EquipSlot이 실행되기 전에 현재 아이템을 검사합니다.
+        /// </summary>
+        [HarmonyPrefix]
+        private static void Prefix(
+            CharacterItems __instance,
+            Optionable<byte> slotID)
+        {
+            LogInfo(
+                "EquipSlot PREFIX entered." +
+                " | RequestedSlot=" +
+                FormatSlot(slotID));
+
+            if (__instance == null)
+            {
+                LogError(
+                    "CharacterItems instance is null.");
+
+                return;
+            }
+
+            Character localCharacter =
+                Character.localCharacter;
+
+            if (localCharacter == null)
+            {
+                LogWarning(
+                    "Character.localCharacter is null.");
+
+                return;
+            }
+
+            if (localCharacter.refs == null ||
+                localCharacter.refs.items == null)
+            {
+                LogWarning(
+                    "Local CharacterItems reference is null.");
+
+                return;
+            }
+
+            /*
+             * 로컬 플레이어의 인벤토리 변경만 처리합니다.
+             */
+            if (localCharacter.refs.items != __instance)
+            {
+                LogInfo(
+                    "Non-local CharacterItems ignored.");
+
+                return;
+            }
+
+            if (localCharacter.data == null)
+            {
+                LogWarning(
+                    "Character.data is null.");
+
+                return;
+            }
+
+            if (localCharacter.player == null)
+            {
+                LogWarning(
+                    "Character.player is null.");
+
+                return;
+            }
+
+            /*
+             * 인벤토리를 완전히 해제하는 None 선택은
+             * 다른 인벤토리 칸 선택이 아니므로 제외합니다.
+             */
+            if (slotID.IsNone)
+            {
+                LogInfo(
+                    "Requested slot is None. Ignored.");
+
+                return;
+            }
+
+            if (__instance.currentSelectedSlot.IsNone)
+            {
+                LogWarning(
+                    "CurrentSelectedSlot is None.");
+
+                return;
+            }
+
+            byte currentSlotID =
+                __instance.currentSelectedSlot.Value;
+
+            byte requestedSlotID =
+                slotID.Value;
+
+            /*
+             * 현재 선택된 칸을 다시 누른 경우에는 드롭하지 않습니다.
+             */
+            if (currentSlotID == requestedSlotID)
+            {
+                LogInfo(
+                    "Same slot selected. Ignored." +
+                    " | Slot=" +
+                    currentSlotID);
+
+                return;
+            }
+
+            Item currentItem =
+                localCharacter.data.currentItem;
+
+            if (currentItem == null)
+            {
+                LogWarning(
+                    "Current held Item is null.");
+
+                return;
+            }
+
+            ItemSlot currentSlot =
+                localCharacter.player.GetItemSlot(
+                    currentSlotID);
+
+            if (currentSlot == null)
+            {
+                LogError(
+                    "Current ItemSlot is null." +
+                    " | SlotID=" +
+                    currentSlotID);
+
+                return;
+            }
+
+            string heldObjectName =
+                NormalizePrefabName(
+                    currentItem.gameObject.name);
+
+            string slotPrefabName =
+                currentSlot.IsEmpty()
+                    ? string.Empty
+                    : NormalizePrefabName(
+                        currentSlot.GetPrefabName());
+
+            string uiItemName =
+                currentItem.UIData != null
+                    ? currentItem.UIData.itemName
+                    : "UIData null";
+
+            bool heldItemIsNestEgg =
+                IsNestEggName(
+                    heldObjectName);
+
+            bool slotPrefabIsNestEgg =
+                IsNestEggName(
+                    slotPrefabName);
+
+            LogInfo(
+                "Detection result" +
+                " | CurrentSlot=" +
+                currentSlotID +
+                " | RequestedSlot=" +
+                requestedSlotID +
+                " | HeldObject=" +
+                heldObjectName +
+                " | SlotPrefab=" +
+                slotPrefabName +
+                " | UIItemName=" +
+                uiItemName +
+                " | HeldIsNestEgg=" +
+                heldItemIsNestEgg +
+                " | SlotIsNestEgg=" +
+                slotPrefabIsNestEgg);
+
+            /*
+             * 손에 든 인스턴스 이름 또는 현재 슬롯 프리팹 이름이
+             * NestEgg이면 목표 Big Egg로 판정합니다.
+             */
+            if (!heldItemIsNestEgg &&
+                !slotPrefabIsNestEgg)
+            {
+                LogInfo(
+                    "Current item is not NestEgg.");
+
+                return;
+            }
+
+            if (currentItem.UIData == null)
+            {
+                LogError(
+                    "NestEgg detected, " +
+                    "but currentItem.UIData is null.");
+
+                return;
+            }
+
+            bool previousCanPocket =
+                currentItem.UIData.canPocket;
+
+            bool previousCanDrop =
+                currentItem.UIData.canDrop;
+
+            /*
+             * 원본 CharacterItems.EquipSlot은
+             * 현재 아이템의 canPocket이 false이면
+             * DropItemRpc를 호출합니다.
+             */
+            currentItem.UIData.canPocket =
+                false;
+
+            currentItem.UIData.canDrop =
+                true;
+
+            /*
+             * 현재 슬롯에 저장된 원본 프리팹에도 적용합니다.
+             * 인스턴스와 프리팹의 UIData가 서로 다른 경우를 대비합니다.
+             */
+            Item slotPrefab =
+                currentSlot.prefab;
+
+            if (slotPrefab != null &&
+                slotPrefab.UIData != null)
+            {
+                slotPrefab.UIData.canPocket =
+                    false;
+
+                slotPrefab.UIData.canDrop =
+                    true;
+            }
+
+            LogWarning(
+                "NEST EGG CONFIRMED." +
+                " Auto-drop setting applied." +
+                " | canPocket: " +
+                previousCanPocket +
+                " -> " +
+                currentItem.UIData.canPocket +
+                " | canDrop: " +
+                previousCanDrop +
+                " -> " +
+                currentItem.UIData.canDrop);
+        }
+
+        /// <summary>
+        /// 원본 EquipSlot 실행 결과를 확인합니다.
+        /// </summary>
+        [HarmonyPostfix]
+        private static void Postfix(
+            CharacterItems __instance,
+            Optionable<byte> slotID)
+        {
+            Character localCharacter =
+                Character.localCharacter;
+
+            string currentItemAfter =
+                "null";
+
+            if (localCharacter != null &&
+                localCharacter.data != null &&
+                localCharacter.data.currentItem != null)
+            {
+                currentItemAfter =
+                    localCharacter
+                        .data
+                        .currentItem
+                        .gameObject
+                        .name;
+            }
+
+            LogInfo(
+                "EquipSlot POSTFIX" +
+                " | RequestedSlot=" +
+                FormatSlot(slotID) +
+                " | CurrentItemAfter=" +
+                currentItemAfter);
+        }
+
+        /// <summary>
+        /// PEAK 원본 DropItemRpc가 실제로 호출됐는지 확인합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(CharacterItems),
+            nameof(CharacterItems.DropItemRpc))]
+        private static class DropItemRpcPatch
+        {
+            [HarmonyPrefix]
+            private static void Prefix(
+                CharacterItems __instance,
+                float throwCharge,
+                byte slotID,
+                Vector3 spawnPos)
+            {
+                Character localCharacter =
+                    Character.localCharacter;
+
+                string itemName =
+                    "null";
+
+                bool isNestEgg =
+                    false;
+
+                if (localCharacter != null &&
+                    localCharacter.data != null &&
+                    localCharacter.data.currentItem != null)
+                {
+                    Item currentItem =
+                        localCharacter.data.currentItem;
+
+                    itemName =
+                        currentItem.gameObject.name;
+
+                    isNestEgg =
+                        IsNestEggName(
+                            itemName);
+                }
+
+                LogWarning(
+                    "DropItemRpc CALLED" +
+                    " | SlotID=" +
+                    slotID +
+                    " | ThrowCharge=" +
+                    throwCharge +
+                    " | SpawnPosition=" +
+                    spawnPos +
+                    " | CurrentItem=" +
+                    itemName +
+                    " | IsNestEgg=" +
+                    isNestEgg);
+            }
+        }
+
+        /// <summary>
+        /// 프리팹 이름이 정확히 NestEgg인지 확인합니다.
+        /// Egg, Bird, BigEgg 등은 인정하지 않습니다.
+        /// </summary>
+        private static bool IsNestEggName(
+            string objectName)
+        {
+            return string.Equals(
+                NormalizePrefabName(
+                    objectName),
+                TargetPrefabName,
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Photon이나 Unity가 붙이는 Clone 접미사를 제거합니다.
+        /// </summary>
+        private static string NormalizePrefabName(
+            string objectName)
+        {
+            if (string.IsNullOrEmpty(
+                    objectName))
+            {
+                return string.Empty;
+            }
+
+            string normalized =
+                objectName.Trim();
+
+            const string cloneSuffix =
+                "(Clone)";
+
+            while (normalized.EndsWith(
+                       cloneSuffix,
+                       StringComparison.OrdinalIgnoreCase))
+            {
+                normalized =
+                    normalized.Substring(
+                        0,
+                        normalized.Length -
+                        cloneSuffix.Length)
+                    .Trim();
+            }
+
+            return normalized;
+        }
+
+        private static string FormatSlot(
+            Optionable<byte> slotID)
+        {
+            if (slotID.IsSome)
+            {
+                return slotID.Value.ToString();
+            }
+
+            return "None";
+        }
+
+        private static void LogInfo(
+            string message)
+        {
+            if (logger != null)
+            {
+                logger.LogInfo(
+                    LogPrefix +
+                    message);
+            }
+        }
+
+        private static void LogWarning(
+            string message)
+        {
+            if (logger != null)
+            {
+                logger.LogWarning(
+                    LogPrefix +
+                    message);
+            }
+        }
+
+        private static void LogError(
+            string message)
+        {
+            if (logger != null)
+            {
+                logger.LogError(
+                    LogPrefix +
+                    message);
+            }
+        }
+    }
+}
