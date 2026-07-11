@@ -1,0 +1,841 @@
+using System;
+using BepInEx.Logging;
+using HarmonyLib;
+using UnityEngine;
+
+namespace Sapphire009.WatchEgg
+{
+    /// <summary>
+    /// NestEgg를 들고 있는 동안 Timer.cs의 소지 시간을 읽어
+    /// 일반 째깍 소리와 마지막 5초의 큰 경고음을 재생합니다.
+    ///
+    /// 별도의 WAV 파일이나 AssetBundle 없이
+    /// 런타임에서 오디오 클립을 생성합니다.
+    ///
+    /// 소리는 NestEgg를 직접 들고 있는 로컬 플레이어에게만 들립니다.
+    ///
+    /// Developer: Sapphire009
+    /// File: TimerSound.cs
+    /// </summary>
+    [DisallowMultipleComponent]
+    public sealed class TimerSound : MonoBehaviour
+    {
+        public const string DeveloperName =
+            "Sapphire009";
+
+        /// <summary>
+        /// 남은 시간이 이 값 이하가 되면 경고음으로 전환합니다.
+        /// </summary>
+        public const float WarningRemainingTime =
+            5f;
+
+        private const float NormalSoundInterval =
+            1f;
+
+        private const float WarningSoundInterval =
+            0.5f;
+
+        private const float NormalVolume =
+            0.42f;
+
+        private const float WarningVolume =
+            0.95f;
+
+        private const int SampleRate =
+            44100;
+
+        private const string LogPrefix =
+            "[TimerSound] ";
+
+        private static readonly ManualLogSource Logger =
+            BepInEx.Logging.Logger.CreateLogSource(
+                "WatchEgg.TimerSound");
+
+        private static AudioClip tickClip;
+        private static AudioClip tockClip;
+        private static AudioClip warningClip;
+
+        private Item item;
+        private Timer timer;
+
+        private AudioSource tickAudioSource;
+        private AudioSource warningAudioSource;
+
+        private bool wasHeldByLocalPlayer;
+        private bool warningPhaseStarted;
+        private bool gameMixerApplied;
+
+        private int lastNormalBeat =
+            -1;
+
+        private int lastWarningBeat =
+            -1;
+
+        private bool playTickNext =
+            true;
+
+        private void Awake()
+        {
+            item = GetComponent<Item>();
+
+            /*
+             * BreakableEgg가 아니라 실제 확인된 NestEgg만 처리합니다.
+             */
+            if (!Timer.IsNestEgg(item))
+            {
+                enabled = false;
+                return;
+            }
+
+            timer = GetComponent<Timer>();
+
+            if (timer == null)
+            {
+                timer =
+                    gameObject.AddComponent<Timer>();
+            }
+
+            CreateSharedAudioClips();
+            CreateAudioSources();
+
+            Logger.LogInfo(
+                LogPrefix +
+                "TimerSound attached to " +
+                item.gameObject.name);
+        }
+
+        private void Update()
+        {
+            if (item == null)
+            {
+                return;
+            }
+
+            ApplyGameAudioMixer();
+
+            if (!IsHeldByLocalPlayer())
+            {
+                StopAndResetSounds();
+                return;
+            }
+
+            if (!wasHeldByLocalPlayer)
+            {
+                BeginNewHold();
+            }
+
+            if (timer == null)
+            {
+                timer =
+                    GetComponent<Timer>();
+
+                if (timer == null)
+                {
+                    return;
+                }
+            }
+
+            float remainingTime =
+                timer.RemainingTime;
+
+            float heldTime =
+                timer.HeldTime;
+
+            if (remainingTime <= 0f)
+            {
+                return;
+            }
+
+            /*
+             * 남은 시간이 5초보다 많으면 일반 째깍 소리입니다.
+             */
+            if (remainingTime >
+                WarningRemainingTime)
+            {
+                UpdateNormalTickSound(
+                    heldTime);
+
+                return;
+            }
+
+            /*
+             * 마지막 5초에는 더 크고 빠른 경고음으로 전환합니다.
+             */
+            UpdateWarningSound(
+                remainingTime);
+        }
+
+        /// <summary>
+        /// 현재 NestEgg를 로컬 플레이어가 직접 들고 있는지 확인합니다.
+        /// </summary>
+        private bool IsHeldByLocalPlayer()
+        {
+            Character localCharacter =
+                Character.localCharacter;
+
+            if (localCharacter == null ||
+                localCharacter.data == null ||
+                item == null)
+            {
+                return false;
+            }
+
+            return
+                localCharacter.IsLocal &&
+                localCharacter.data.currentItem == item &&
+                item.itemState == ItemState.Held;
+        }
+
+        /// <summary>
+        /// NestEgg를 새로 집었을 때 사운드 순서를 초기화합니다.
+        /// </summary>
+        private void BeginNewHold()
+        {
+            wasHeldByLocalPlayer =
+                true;
+
+            warningPhaseStarted =
+                false;
+
+            lastNormalBeat =
+                -1;
+
+            lastWarningBeat =
+                -1;
+
+            playTickNext =
+                true;
+
+            if (tickAudioSource != null)
+            {
+                tickAudioSource.Stop();
+            }
+
+            if (warningAudioSource != null)
+            {
+                warningAudioSource.Stop();
+            }
+
+            Logger.LogInfo(
+                LogPrefix +
+                "NestEgg timer sound started.");
+        }
+
+        /// <summary>
+        /// 일반 구간에서 1초마다 Tick과 Tock을 번갈아 재생합니다.
+        /// </summary>
+        private void UpdateNormalTickSound(
+            float heldTime)
+        {
+            int currentBeat =
+                Mathf.FloorToInt(
+                    heldTime /
+                    NormalSoundInterval);
+
+            if (currentBeat ==
+                lastNormalBeat)
+            {
+                return;
+            }
+
+            lastNormalBeat =
+                currentBeat;
+
+            PlayNormalTick();
+        }
+
+        private void PlayNormalTick()
+        {
+            if (tickAudioSource == null)
+            {
+                return;
+            }
+
+            AudioClip clipToPlay =
+                playTickNext
+                    ? tickClip
+                    : tockClip;
+
+            if (clipToPlay == null)
+            {
+                return;
+            }
+
+            tickAudioSource.pitch =
+                playTickNext
+                    ? 1f
+                    : 0.96f;
+
+            tickAudioSource.PlayOneShot(
+                clipToPlay,
+                NormalVolume);
+
+            playTickNext =
+                !playTickNext;
+        }
+
+        /// <summary>
+        /// 마지막 5초 동안 0.5초마다 경고음을 재생합니다.
+        /// </summary>
+        private void UpdateWarningSound(
+            float remainingTime)
+        {
+            float warningElapsed =
+                WarningRemainingTime -
+                remainingTime;
+
+            warningElapsed =
+                Mathf.Clamp(
+                    warningElapsed,
+                    0f,
+                    WarningRemainingTime);
+
+            int currentWarningBeat =
+                Mathf.FloorToInt(
+                    warningElapsed /
+                    WarningSoundInterval);
+
+            if (!warningPhaseStarted)
+            {
+                warningPhaseStarted =
+                    true;
+
+                lastWarningBeat =
+                    currentWarningBeat;
+
+                Logger.LogWarning(
+                    LogPrefix +
+                    "NestEgg timer entered " +
+                    "the final 5-second warning phase.");
+
+                PlayWarningSound(
+                    remainingTime);
+
+                return;
+            }
+
+            if (currentWarningBeat ==
+                lastWarningBeat)
+            {
+                return;
+            }
+
+            lastWarningBeat =
+                currentWarningBeat;
+
+            PlayWarningSound(
+                remainingTime);
+        }
+
+        /// <summary>
+        /// 시간이 줄어들수록 경고음의 음높이와 크기를 올립니다.
+        /// </summary>
+        private void PlayWarningSound(
+            float remainingTime)
+        {
+            if (warningAudioSource == null ||
+                warningClip == null)
+            {
+                return;
+            }
+
+            float progress =
+                1f -
+                Mathf.Clamp01(
+                    remainingTime /
+                    WarningRemainingTime);
+
+            warningAudioSource.pitch =
+                Mathf.Lerp(
+                    1f,
+                    1.35f,
+                    progress);
+
+            float volume =
+                Mathf.Lerp(
+                    WarningVolume,
+                    1f,
+                    progress);
+
+            warningAudioSource.PlayOneShot(
+                warningClip,
+                volume);
+        }
+
+        /// <summary>
+        /// 달걀을 놓거나 던지면 재생 중인 소리를 정지합니다.
+        /// </summary>
+        private void StopAndResetSounds()
+        {
+            if (!wasHeldByLocalPlayer)
+            {
+                return;
+            }
+
+            wasHeldByLocalPlayer =
+                false;
+
+            warningPhaseStarted =
+                false;
+
+            lastNormalBeat =
+                -1;
+
+            lastWarningBeat =
+                -1;
+
+            playTickNext =
+                true;
+
+            if (tickAudioSource != null)
+            {
+                tickAudioSource.Stop();
+            }
+
+            if (warningAudioSource != null)
+            {
+                warningAudioSource.Stop();
+            }
+
+            Logger.LogInfo(
+                LogPrefix +
+                "NestEgg timer sound stopped.");
+        }
+
+        private void OnDisable()
+        {
+            StopAndResetSounds();
+        }
+
+        private void OnDestroy()
+        {
+            if (tickAudioSource != null)
+            {
+                tickAudioSource.Stop();
+            }
+
+            if (warningAudioSource != null)
+            {
+                warningAudioSource.Stop();
+            }
+        }
+
+        /// <summary>
+        /// 일반 째깍 소리와 경고음이 겹쳐도 끊기지 않도록
+        /// AudioSource를 두 개 생성합니다.
+        /// </summary>
+        private void CreateAudioSources()
+        {
+            tickAudioSource =
+                gameObject.AddComponent<AudioSource>();
+
+            warningAudioSource =
+                gameObject.AddComponent<AudioSource>();
+
+            ConfigureAudioSource(
+                tickAudioSource,
+                64);
+
+            ConfigureAudioSource(
+                warningAudioSource,
+                32);
+        }
+
+        private static void ConfigureAudioSource(
+            AudioSource audioSource,
+            int priority)
+        {
+            if (audioSource == null)
+            {
+                return;
+            }
+
+            audioSource.playOnAwake =
+                false;
+
+            audioSource.loop =
+                false;
+
+            /*
+             * 현재 로컬 플레이어에게만 재생되므로
+             * 거리 감쇠가 없는 2D 사운드로 설정합니다.
+             */
+            audioSource.spatialBlend =
+                0f;
+
+            audioSource.dopplerLevel =
+                0f;
+
+            audioSource.volume =
+                1f;
+
+            audioSource.pitch =
+                1f;
+
+            audioSource.priority =
+                priority;
+
+            audioSource.bypassEffects =
+                false;
+
+            audioSource.bypassListenerEffects =
+                false;
+
+            audioSource.bypassReverbZones =
+                true;
+        }
+
+        /// <summary>
+        /// PEAK 효과음 믹서가 준비되면 연결합니다.
+        /// </summary>
+        private void ApplyGameAudioMixer()
+        {
+            if (gameMixerApplied ||
+                tickAudioSource == null ||
+                warningAudioSource == null ||
+                SFX_Player.instance == null)
+            {
+                return;
+            }
+
+            tickAudioSource.outputAudioMixerGroup =
+                SFX_Player.instance.defaultMixerGroup;
+
+            warningAudioSource.outputAudioMixerGroup =
+                SFX_Player.instance.defaultMixerGroup;
+
+            gameMixerApplied =
+                true;
+
+            Logger.LogInfo(
+                LogPrefix +
+                "PEAK SFX mixer applied.");
+        }
+
+        /// <summary>
+        /// 공용 Tick, Tock, Warning 클립을 한 번만 생성합니다.
+        /// </summary>
+        private static void CreateSharedAudioClips()
+        {
+            if (tickClip == null)
+            {
+                tickClip =
+                    CreateClockClickClip(
+                        "WatchEgg_NestEgg_TimerTick",
+                        1750f,
+                        0.065f,
+                        0.78f);
+            }
+
+            if (tockClip == null)
+            {
+                tockClip =
+                    CreateClockClickClip(
+                        "WatchEgg_NestEgg_TimerTock",
+                        1050f,
+                        0.085f,
+                        0.72f);
+            }
+
+            if (warningClip == null)
+            {
+                warningClip =
+                    CreateWarningClip(
+                        "WatchEgg_NestEgg_TimerWarning",
+                        0.22f);
+            }
+        }
+
+        /// <summary>
+        /// 짧은 시계 클릭음을 생성합니다.
+        /// </summary>
+        private static AudioClip CreateClockClickClip(
+            string clipName,
+            float frequency,
+            float duration,
+            float strength)
+        {
+            int sampleCount =
+                Mathf.Max(
+                    1,
+                    Mathf.CeilToInt(
+                        SampleRate *
+                        duration));
+
+            float[] samples =
+                new float[sampleCount];
+
+            uint noiseState =
+                2463534242u;
+
+            for (int i = 0;
+                 i < sampleCount;
+                 i++)
+            {
+                float time =
+                    (float)i /
+                    SampleRate;
+
+                float normalizedTime =
+                    time /
+                    duration;
+
+                float attack =
+                    Mathf.Clamp01(
+                        time /
+                        0.0025f);
+
+                float decay =
+                    Mathf.Exp(
+                        -normalizedTime *
+                        8.5f);
+
+                float envelope =
+                    attack *
+                    decay;
+
+                float primaryTone =
+                    Mathf.Sin(
+                        2f *
+                        Mathf.PI *
+                        frequency *
+                        time);
+
+                float secondaryTone =
+                    Mathf.Sin(
+                        2f *
+                        Mathf.PI *
+                        frequency *
+                        2.17f *
+                        time);
+
+                noiseState =
+                    noiseState *
+                    1664525u +
+                    1013904223u;
+
+                float noise =
+                    ((noiseState >> 8) /
+                     16777215f) *
+                    2f -
+                    1f;
+
+                float value =
+                    primaryTone *
+                    0.58f +
+                    secondaryTone *
+                    0.20f +
+                    noise *
+                    0.22f;
+
+                samples[i] =
+                    Mathf.Clamp(
+                        value *
+                        envelope *
+                        strength,
+                        -1f,
+                        1f);
+            }
+
+            return CreateAudioClipFromSamples(
+                clipName,
+                samples);
+        }
+
+        /// <summary>
+        /// 마지막 5초에 사용할 강한 경고음을 생성합니다.
+        /// </summary>
+        private static AudioClip CreateWarningClip(
+            string clipName,
+            float duration)
+        {
+            int sampleCount =
+                Mathf.Max(
+                    1,
+                    Mathf.CeilToInt(
+                        SampleRate *
+                        duration));
+
+            float[] samples =
+                new float[sampleCount];
+
+            for (int i = 0;
+                 i < sampleCount;
+                 i++)
+            {
+                float time =
+                    (float)i /
+                    SampleRate;
+
+                float normalizedTime =
+                    time /
+                    duration;
+
+                float attack =
+                    Mathf.Clamp01(
+                        time /
+                        0.006f);
+
+                float release =
+                    Mathf.Clamp01(
+                        (duration - time) /
+                        0.035f);
+
+                float envelope =
+                    attack *
+                    release *
+                    Mathf.Exp(
+                        -normalizedTime *
+                        1.4f);
+
+                float mainTone =
+                    Mathf.Sin(
+                        2f *
+                        Mathf.PI *
+                        880f *
+                        time);
+
+                float urgentTone =
+                    Mathf.Sin(
+                        2f *
+                        Mathf.PI *
+                        1320f *
+                        time);
+
+                float highTone =
+                    Mathf.Sin(
+                        2f *
+                        Mathf.PI *
+                        1760f *
+                        time);
+
+                float modulation =
+                    0.82f +
+                    0.18f *
+                    Mathf.Sin(
+                        2f *
+                        Mathf.PI *
+                        18f *
+                        time);
+
+                float value =
+                    mainTone *
+                    0.58f +
+                    urgentTone *
+                    0.27f +
+                    highTone *
+                    0.15f;
+
+                samples[i] =
+                    Mathf.Clamp(
+                        value *
+                        envelope *
+                        modulation *
+                        0.9f,
+                        -1f,
+                        1f);
+            }
+
+            return CreateAudioClipFromSamples(
+                clipName,
+                samples);
+        }
+
+        /// <summary>
+        /// AudioClip.SetData를 사용하지 않고 PCMReaderCallback으로
+        /// 샘플을 전달합니다.
+        ///
+        /// Unity 6 참조에서 발생했던 ReadOnlySpan 관련
+        /// CS0518 컴파일 오류를 방지합니다.
+        /// </summary>
+        private static AudioClip CreateAudioClipFromSamples(
+            string clipName,
+            float[] sourceSamples)
+        {
+            if (sourceSamples == null ||
+                sourceSamples.Length == 0)
+            {
+                return null;
+            }
+
+            AudioClip audioClip =
+                AudioClip.Create(
+                    clipName,
+                    sourceSamples.Length,
+                    1,
+                    SampleRate,
+                    false,
+                    delegate (float[] outputSamples)
+                    {
+                        if (outputSamples == null)
+                        {
+                            return;
+                        }
+
+                        int copyLength =
+                            Mathf.Min(
+                                outputSamples.Length,
+                                sourceSamples.Length);
+
+                        Array.Copy(
+                            sourceSamples,
+                            0,
+                            outputSamples,
+                            0,
+                            copyLength);
+
+                        for (int i = copyLength;
+                             i < outputSamples.Length;
+                             i++)
+                        {
+                            outputSamples[i] =
+                                0f;
+                        }
+                    });
+
+            if (audioClip != null)
+            {
+                audioClip.hideFlags =
+                    HideFlags.HideAndDontSave;
+            }
+
+            return audioClip;
+        }
+
+        /// <summary>
+        /// 모든 NestEgg 인스턴스에 Timer와 TimerSound를 부착합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            "Awake")]
+        private static class ItemAwakePatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(
+                Item __instance)
+            {
+                if (!Timer.IsNestEgg(
+                        __instance))
+                {
+                    return;
+                }
+
+                if (__instance.GetComponent<Timer>() ==
+                    null)
+                {
+                    __instance.gameObject
+                        .AddComponent<Timer>();
+                }
+
+                if (__instance.GetComponent<TimerSound>() !=
+                    null)
+                {
+                    return;
+                }
+
+                __instance.gameObject
+                    .AddComponent<TimerSound>();
+            }
+        }
+    }
+}
