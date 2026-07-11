@@ -1,0 +1,765 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using BepInEx.Logging;
+using HarmonyLib;
+using Photon.Pun;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using Zorro.Core;
+using PhotonHashtable =
+    ExitGames.Client.Photon.Hashtable;
+
+namespace Sapphire009.WatchEgg
+{
+    /// <summary>
+    /// Airport를 제외한 첫 번째 게임 맵에서
+    /// 모든 접속 플레이어의 캐릭터 생성이 완료되면,
+    /// 호스트가 플레이어 한 명을 무작위로 선택하여
+    /// NestEgg 하나를 인벤토리에 지급합니다.
+    ///
+    /// 4명 접속 시 4명 중 무작위 1명,
+    /// 3명 접속 시 3명 중 무작위 1명,
+    /// 2명 접속 시 2명 중 무작위 1명에게만 지급됩니다.
+    ///
+    /// Developer: Sapphire009
+    /// File: RandomStartEgg.cs
+    /// </summary>
+    [HarmonyPatch(
+        typeof(CharacterSpawner),
+        "Update")]
+    public static class RandomStartEgg
+    {
+        public const string DeveloperName =
+            "Sapphire009";
+
+        public const string TargetPrefabName =
+            "NestEgg";
+
+        /// <summary>
+        /// 모든 플레이어의 캐릭터가 발견된 뒤
+        /// 접속 인원이 안정적으로 유지되어야 하는 시간입니다.
+        /// </summary>
+        private const float RequiredStableTime =
+            1.5f;
+
+        private const string LogPrefix =
+            "[RandomStartEgg] ";
+
+        /// <summary>
+        /// 호스트가 바뀌어도 중복 지급되지 않도록
+        /// Photon Room Custom Property에 지급 여부를 저장합니다.
+        /// </summary>
+        private const string RoomPropertyKey =
+            "Sapphire009.WatchEgg.StartEggGranted";
+
+        private static readonly ManualLogSource Logger =
+            BepInEx.Logging.Logger.CreateLogSource(
+                "WatchEgg.RandomStartEgg");
+
+        private static int currentSceneHandle =
+            int.MinValue;
+
+        private static bool routineStarted;
+
+        private static bool eggGranted;
+
+        private static bool airportPropertyReset;
+
+        private static int lastLoggedReadyCount =
+            -1;
+
+        [HarmonyPrepare]
+        private static bool Prepare()
+        {
+            Logger.LogInfo(
+                LogPrefix +
+                "PATCH READY: CharacterSpawner.Update");
+
+            return true;
+        }
+
+        /// <summary>
+        /// CharacterSpawner가 실행되는 동안 현재 씬과
+        /// 모든 플레이어의 생성 상태를 확인합니다.
+        /// </summary>
+        [HarmonyPostfix]
+        private static void Postfix(
+            CharacterSpawner __instance)
+        {
+            ResetStateWhenSceneChanged();
+
+            if (__instance == null)
+            {
+                return;
+            }
+
+            if (!PhotonNetwork.InRoom ||
+                PhotonNetwork.CurrentRoom == null)
+            {
+                return;
+            }
+
+            /*
+             * Airport에서는 달걀을 지급하지 않습니다.
+             *
+             * 이전 게임에서 사용한 Room Property가 남아 있을 수 있으므로
+             * Airport에 들어오면 다음 게임을 위해 false로 초기화합니다.
+             */
+            if (!GameHandler.IsOnIsland)
+            {
+                ResetRoomPropertyInAirport();
+                return;
+            }
+
+            /*
+             * 첫 맵인 Beach 구간에서만 지급합니다.
+             * 이후 Tropics, Alpine 등의 구간에서는 실행하지 않습니다.
+             */
+            if (MapHandler.CurrentSegmentNumber !=
+                Segment.Beach)
+            {
+                return;
+            }
+
+            /*
+             * 이전 호스트가 이미 지급했다면
+             * 새로운 호스트가 다시 지급하지 않습니다.
+             */
+            if (IsEggAlreadyGrantedInRoom())
+            {
+                eggGranted = true;
+                return;
+            }
+
+            if (!PhotonNetwork.IsMasterClient)
+            {
+                return;
+            }
+
+            if (eggGranted ||
+                routineStarted)
+            {
+                return;
+            }
+
+            routineStarted = true;
+
+            int sceneHandle =
+                SceneManager
+                    .GetActiveScene()
+                    .handle;
+
+            __instance.StartCoroutine(
+                WaitForAllPlayersAndGrantEgg(
+                    sceneHandle));
+        }
+
+        /// <summary>
+        /// Photon 방에 들어온 모든 플레이어의 Character와 Player가
+        /// 생성될 때까지 기다린 뒤 무작위 한 명에게 지급합니다.
+        /// </summary>
+        private static IEnumerator
+            WaitForAllPlayersAndGrantEgg(
+                int startedSceneHandle)
+        {
+            float stableTime =
+                0f;
+
+            int stablePlayerCount =
+                -1;
+
+            Logger.LogInfo(
+                LogPrefix +
+                "Waiting for all connected players " +
+                "to finish spawning.");
+
+            while (true)
+            {
+                if (!CanContinueWaiting(
+                        startedSceneHandle))
+                {
+                    routineStarted = false;
+                    yield break;
+                }
+
+                if (IsEggAlreadyGrantedInRoom())
+                {
+                    eggGranted = true;
+                    routineStarted = false;
+                    yield break;
+                }
+
+                List<Character> readyCharacters;
+                int roomPlayerCount;
+
+                bool allPlayersReady =
+                    TryGetAllSpawnedCharacters(
+                        out readyCharacters,
+                        out roomPlayerCount);
+
+                if (!allPlayersReady)
+                {
+                    stableTime = 0f;
+                    stablePlayerCount = -1;
+
+                    yield return null;
+                    continue;
+                }
+
+                if (roomPlayerCount !=
+                    stablePlayerCount)
+                {
+                    stablePlayerCount =
+                        roomPlayerCount;
+
+                    stableTime =
+                        0f;
+
+                    if (lastLoggedReadyCount !=
+                        roomPlayerCount)
+                    {
+                        lastLoggedReadyCount =
+                            roomPlayerCount;
+
+                        Logger.LogInfo(
+                            LogPrefix +
+                            "All current player characters are ready." +
+                            " | PlayerCount=" +
+                            roomPlayerCount);
+                    }
+
+                    yield return null;
+                    continue;
+                }
+
+                stableTime +=
+                    Time.unscaledDeltaTime;
+
+                if (stableTime <
+                    RequiredStableTime)
+                {
+                    yield return null;
+                    continue;
+                }
+
+                break;
+            }
+
+            /*
+             * 안정화 판정 직후 한 번 더 전체 인원을 확인합니다.
+             */
+            List<Character> finalCharacters;
+            int finalPlayerCount;
+
+            if (!TryGetAllSpawnedCharacters(
+                    out finalCharacters,
+                    out finalPlayerCount))
+            {
+                routineStarted = false;
+                yield break;
+            }
+
+            if (finalCharacters.Count == 0)
+            {
+                Logger.LogError(
+                    LogPrefix +
+                    "Egg grant failed: " +
+                    "no spawned character was found.");
+
+                routineStarted = false;
+                yield break;
+            }
+
+            Item nestEggPrefab;
+
+            if (!TryGetNestEggPrefab(
+                    out nestEggPrefab))
+            {
+                Logger.LogError(
+                    LogPrefix +
+                    "Egg grant failed: " +
+                    "NestEgg was not found in ItemDatabase.");
+
+                routineStarted = false;
+                yield break;
+            }
+
+            /*
+             * 인벤토리에 공간이 있는 플레이어만 후보로 사용합니다.
+             *
+             * 첫 맵 시작 직후에는 일반적으로 전원이 빈 인벤토리이므로
+             * 접속한 모든 플레이어가 후보가 됩니다.
+             */
+            List<Character> eligibleCharacters =
+                new List<Character>();
+
+            for (int i = 0;
+                 i < finalCharacters.Count;
+                 i++)
+            {
+                Character character =
+                    finalCharacters[i];
+
+                if (character == null ||
+                    character.player == null)
+                {
+                    continue;
+                }
+
+                if (!character.player.HasEmptySlot(
+                        nestEggPrefab.itemID))
+                {
+                    Logger.LogWarning(
+                        LogPrefix +
+                        "Player excluded because inventory is full." +
+                        " | Player=" +
+                        GetCharacterName(character));
+
+                    continue;
+                }
+
+                eligibleCharacters.Add(
+                    character);
+            }
+
+            if (eligibleCharacters.Count == 0)
+            {
+                Logger.LogError(
+                    LogPrefix +
+                    "Egg grant failed: " +
+                    "all player inventories are full.");
+
+                routineStarted = false;
+                yield break;
+            }
+
+            /*
+             * 랜덤값은 호스트에서만 결정합니다.
+             */
+            int randomIndex =
+                UnityEngine.Random.Range(
+                    0,
+                    eligibleCharacters.Count);
+
+            Character selectedCharacter =
+                eligibleCharacters[randomIndex];
+
+            ItemSlot addedSlot;
+
+            bool addSucceeded =
+                selectedCharacter.player.AddItem(
+                    nestEggPrefab.itemID,
+                    null,
+                    out addedSlot);
+
+            if (!addSucceeded ||
+                addedSlot == null)
+            {
+                Logger.LogError(
+                    LogPrefix +
+                    "NestEgg could not be added to " +
+                    GetCharacterName(
+                        selectedCharacter) +
+                    "'s inventory.");
+
+                routineStarted = false;
+                yield break;
+            }
+
+            eggGranted = true;
+            routineStarted = false;
+
+            SetRoomEggGranted(
+                true);
+
+            int actorNumber =
+                GetActorNumber(
+                    selectedCharacter);
+
+            Logger.LogWarning(
+                LogPrefix +
+                "NestEgg granted to one random player." +
+                " | SelectedPlayer=" +
+                GetCharacterName(
+                    selectedCharacter) +
+                " | ActorNumber=" +
+                actorNumber +
+                " | ConnectedPlayers=" +
+                finalPlayerCount +
+                " | SlotID=" +
+                addedSlot.itemSlotID +
+                " | ItemID=" +
+                nestEggPrefab.itemID);
+        }
+
+        /// <summary>
+        /// 현재 Photon 방에 접속한 모든 플레이어가
+        /// Character, Player, inventory 참조까지 생성됐는지 확인합니다.
+        /// </summary>
+        private static bool
+            TryGetAllSpawnedCharacters(
+                out List<Character> characters,
+                out int roomPlayerCount)
+        {
+            characters =
+                new List<Character>();
+
+            Photon.Realtime.Player[] roomPlayers =
+                PhotonNetwork.PlayerList;
+
+            roomPlayerCount =
+                roomPlayers != null
+                    ? roomPlayers.Length
+                    : 0;
+
+            if (roomPlayers == null ||
+                roomPlayers.Length == 0)
+            {
+                return false;
+            }
+
+            for (int i = 0;
+                 i < roomPlayers.Length;
+                 i++)
+            {
+                Photon.Realtime.Player roomPlayer =
+                    roomPlayers[i];
+
+                if (roomPlayer == null)
+                {
+                    return false;
+                }
+
+                Character character;
+
+                if (!PlayerHandler.TryGetCharacter(
+                        roomPlayer.ActorNumber,
+                        out character))
+                {
+                    return false;
+                }
+
+                if (character == null ||
+                    character.data == null ||
+                    character.refs == null ||
+                    character.refs.items == null ||
+                    character.player == null)
+                {
+                    return false;
+                }
+
+                characters.Add(
+                    character);
+            }
+
+            return characters.Count ==
+                   roomPlayers.Length;
+        }
+
+        /// <summary>
+        /// 첫 게임 맵에서 대기 작업을 계속할 수 있는지 확인합니다.
+        /// </summary>
+        private static bool CanContinueWaiting(
+            int startedSceneHandle)
+        {
+            if (SceneManager
+                    .GetActiveScene()
+                    .handle !=
+                startedSceneHandle)
+            {
+                return false;
+            }
+
+            if (!PhotonNetwork.InRoom ||
+                PhotonNetwork.CurrentRoom == null ||
+                !PhotonNetwork.IsMasterClient)
+            {
+                return false;
+            }
+
+            if (!GameHandler.IsOnIsland)
+            {
+                return false;
+            }
+
+            return MapHandler.CurrentSegmentNumber ==
+                   Segment.Beach;
+        }
+
+        /// <summary>
+        /// ItemDatabase 또는 Resources에서
+        /// 실제 NestEgg Item 프리팹을 찾습니다.
+        /// </summary>
+        private static bool TryGetNestEggPrefab(
+            out Item nestEggPrefab)
+        {
+            nestEggPrefab =
+                null;
+
+            ItemDatabase itemDatabase =
+                SingletonAsset<ItemDatabase>.Instance;
+
+            if (itemDatabase != null &&
+                itemDatabase.itemLookup != null)
+            {
+                foreach (
+                    KeyValuePair<ushort, Item> entry
+                    in itemDatabase.itemLookup)
+                {
+                    Item item =
+                        entry.Value;
+
+                    if (item == null)
+                    {
+                        continue;
+                    }
+
+                    if (!IsNestEggName(
+                            item.gameObject.name))
+                    {
+                        continue;
+                    }
+
+                    nestEggPrefab =
+                        item;
+
+                    return true;
+                }
+            }
+
+            /*
+             * ItemDatabase 검색이 실패한 경우
+             * PEAK의 원본 Resources 경로를 사용합니다.
+             */
+            GameObject resourcePrefab =
+                Resources.Load<GameObject>(
+                    "0_Items/" +
+                    TargetPrefabName);
+
+            if (resourcePrefab == null)
+            {
+                return false;
+            }
+
+            nestEggPrefab =
+                resourcePrefab.GetComponent<Item>();
+
+            if (nestEggPrefab == null)
+            {
+                nestEggPrefab =
+                    resourcePrefab
+                        .GetComponentInChildren<Item>(
+                            true);
+            }
+
+            return nestEggPrefab != null;
+        }
+
+        private static bool IsNestEggName(
+            string objectName)
+        {
+            return string.Equals(
+                NormalizeObjectName(
+                    objectName),
+                TargetPrefabName,
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string NormalizeObjectName(
+            string objectName)
+        {
+            if (string.IsNullOrEmpty(
+                    objectName))
+            {
+                return string.Empty;
+            }
+
+            string normalized =
+                objectName.Trim();
+
+            const string cloneSuffix =
+                "(Clone)";
+
+            while (normalized.EndsWith(
+                       cloneSuffix,
+                       StringComparison.OrdinalIgnoreCase))
+            {
+                normalized =
+                    normalized.Substring(
+                        0,
+                        normalized.Length -
+                        cloneSuffix.Length)
+                    .Trim();
+            }
+
+            return normalized;
+        }
+
+        /// <summary>
+        /// 이전 게임에서 true로 남은 방 속성을
+        /// Airport에서 false로 초기화합니다.
+        /// </summary>
+        private static void ResetRoomPropertyInAirport()
+        {
+            if (airportPropertyReset ||
+                !PhotonNetwork.IsMasterClient ||
+                PhotonNetwork.CurrentRoom == null)
+            {
+                return;
+            }
+
+            airportPropertyReset =
+                true;
+
+            SetRoomEggGranted(
+                false);
+
+            Logger.LogInfo(
+                LogPrefix +
+                "Airport detected. " +
+                "Start egg room state reset.");
+        }
+
+        /// <summary>
+        /// Photon Room Property에 기록된 지급 여부를 확인합니다.
+        /// </summary>
+        private static bool
+            IsEggAlreadyGrantedInRoom()
+        {
+            if (PhotonNetwork.CurrentRoom == null ||
+                PhotonNetwork
+                    .CurrentRoom
+                    .CustomProperties == null)
+            {
+                return false;
+            }
+
+            if (!PhotonNetwork
+                    .CurrentRoom
+                    .CustomProperties
+                    .ContainsKey(
+                        RoomPropertyKey))
+            {
+                return false;
+            }
+
+            object propertyValue =
+                PhotonNetwork
+                    .CurrentRoom
+                    .CustomProperties[
+                        RoomPropertyKey];
+
+            if (!(propertyValue is bool))
+            {
+                return false;
+            }
+
+            return (bool)propertyValue;
+        }
+
+        /// <summary>
+        /// 호스트 변경 후에도 지급 여부가 유지되도록
+        /// Photon Room Property에 결과를 기록합니다.
+        /// </summary>
+        private static void SetRoomEggGranted(
+            bool value)
+        {
+            if (!PhotonNetwork.InRoom ||
+                PhotonNetwork.CurrentRoom == null ||
+                !PhotonNetwork.IsMasterClient)
+            {
+                return;
+            }
+
+            PhotonHashtable properties =
+                new PhotonHashtable();
+
+            properties[
+                RoomPropertyKey] =
+                value;
+
+            PhotonNetwork
+                .CurrentRoom
+                .SetCustomProperties(
+                    properties);
+        }
+
+        private static string GetCharacterName(
+            Character character)
+        {
+            if (character == null)
+            {
+                return "Unknown";
+            }
+
+            if (character.photonView != null &&
+                character.photonView.Owner != null)
+            {
+                return character
+                    .photonView
+                    .Owner
+                    .NickName;
+            }
+
+            return character.gameObject.name;
+        }
+
+        private static int GetActorNumber(
+            Character character)
+        {
+            if (character == null ||
+                character.photonView == null ||
+                character.photonView.Owner == null)
+            {
+                return -1;
+            }
+
+            return character
+                .photonView
+                .Owner
+                .ActorNumber;
+        }
+
+        /// <summary>
+        /// 씬이 바뀌면 로컬 대기 상태를 초기화합니다.
+        /// Room Property는 Airport에서 별도로 초기화합니다.
+        /// </summary>
+        private static void ResetStateWhenSceneChanged()
+        {
+            int sceneHandle =
+                SceneManager
+                    .GetActiveScene()
+                    .handle;
+
+            if (currentSceneHandle ==
+                sceneHandle)
+            {
+                return;
+            }
+
+            currentSceneHandle =
+                sceneHandle;
+
+            routineStarted =
+                false;
+
+            eggGranted =
+                false;
+
+            airportPropertyReset =
+                false;
+
+            lastLoggedReadyCount =
+                -1;
+
+            Logger.LogInfo(
+                LogPrefix +
+                "Scene state reset." +
+                " | Scene=" +
+                SceneManager
+                    .GetActiveScene()
+                    .name);
+        }
+    }
+}
