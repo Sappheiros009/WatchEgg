@@ -1,0 +1,434 @@
+using BepInEx.Logging;
+using HarmonyLib;
+using Photon.Pun;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+namespace Sapphire009.WatchEgg
+{
+    /// <summary>
+    /// NestEgg가 깨진 뒤 호스트가 Y키를 누르면
+    /// 마지막 EggCheckpoint 위치에 새 NestEgg를 생성합니다.
+    ///
+    /// 생성된 NestEgg는 플레이어가 직접 집기 전까지
+    /// Kinematic 상태로 고정되어 굴러가거나 깨지지 않습니다.
+    ///
+    /// 플레이어를 체크포인트로 이동시키지 않으며
+    /// 달걀만 마지막 체크포인트에 생성합니다.
+    ///
+    /// Developer: Sapphire009
+    /// File: YSpawn.cs
+    /// </summary>
+    [HarmonyPatch(
+        typeof(CharacterSpawner),
+        "Update")]
+    public static class YSpawn
+    {
+        public const string DeveloperName =
+            "Sapphire009";
+
+        public const string TargetPrefabName =
+            "NestEgg";
+
+        public const KeyCode SpawnKey =
+            KeyCode.Y;
+
+        private const string LogPrefix =
+            "[YSpawn] ";
+
+        /// <summary>
+        /// Y키 연속 입력으로 같은 파손에
+        /// 달걀이 여러 개 생성되는 것을 방지합니다.
+        /// </summary>
+        private const float InputCooldown =
+            0.75f;
+
+        private static readonly ManualLogSource Logger =
+            BepInEx.Logging.Logger.CreateLogSource(
+                "WatchEgg.YSpawn");
+
+        /// <summary>
+        /// 현재 씬에서 이미 처리한 파손 횟수입니다.
+        ///
+        /// BrokenEggCount가 이 값보다 커야
+        /// 새 달걀을 생성할 수 있습니다.
+        /// </summary>
+        private static int handledBrokenEggCount;
+
+        private static int currentSceneHandle =
+            int.MinValue;
+
+        private static int lastProcessedFrame =
+            -1;
+
+        private static float nextAllowedInputTime;
+
+        [HarmonyPrepare]
+        private static bool Prepare()
+        {
+            Logger.LogInfo(
+                LogPrefix +
+                "PATCH READY: CharacterSpawner.Update");
+
+            return true;
+        }
+
+        /// <summary>
+        /// CharacterSpawner.Update가 여러 인스턴스에서 호출되더라도
+        /// 한 프레임에 Y키 입력을 한 번만 처리합니다.
+        /// </summary>
+        [HarmonyPostfix]
+        private static void Postfix()
+        {
+            ResetWhenSceneChanged();
+
+            if (lastProcessedFrame ==
+                Time.frameCount)
+            {
+                return;
+            }
+
+            lastProcessedFrame =
+                Time.frameCount;
+
+            if (!Input.GetKeyDown(
+                    SpawnKey))
+            {
+                return;
+            }
+
+            if (Time.unscaledTime <
+                nextAllowedInputTime)
+            {
+                return;
+            }
+
+            nextAllowedInputTime =
+                Time.unscaledTime +
+                InputCooldown;
+
+            TrySpawnNestEgg();
+        }
+
+        /// <summary>
+        /// Y키 입력 시 체크포인트와 파손 상태를 검사한 뒤
+        /// NestEgg를 네트워크 생성합니다.
+        /// </summary>
+        private static void TrySpawnNestEgg()
+        {
+            if (!PhotonNetwork.InRoom)
+            {
+                Logger.LogWarning(
+                    LogPrefix +
+                    "Spawn cancelled: " +
+                    "Photon room is not ready.");
+
+                return;
+            }
+
+            /*
+             * 아이템 생성 권한은 호스트만 가집니다.
+             * 클라이언트가 각자 생성하면 달걀이 중복될 수 있습니다.
+             */
+            if (!PhotonNetwork.IsMasterClient)
+            {
+                Logger.LogWarning(
+                    LogPrefix +
+                    "Spawn cancelled: " +
+                    "only the host can use Y spawn.");
+
+                return;
+            }
+
+            Character localCharacter =
+                Character.localCharacter;
+
+            if (localCharacter == null ||
+                !localCharacter.IsLocal)
+            {
+                Logger.LogWarning(
+                    LogPrefix +
+                    "Spawn cancelled: " +
+                    "local character is not ready.");
+
+                return;
+            }
+
+            /*
+             * 달걀이 한 번 이상 깨진 뒤에만 Y키 생성을 허용합니다.
+             */
+            int currentBrokenCount =
+                EggCheckpoint.BrokenEggCount;
+
+            if (currentBrokenCount <= 0)
+            {
+                Logger.LogWarning(
+                    LogPrefix +
+                    "Spawn cancelled: " +
+                    "NestEgg has not been broken.");
+
+                return;
+            }
+
+            /*
+             * 같은 파손 횟수에 대해 이미 한 번 생성했다면
+             * 추가 생성하지 않습니다.
+             */
+            if (currentBrokenCount <=
+                handledBrokenEggCount)
+            {
+                Logger.LogWarning(
+                    LogPrefix +
+                    "Spawn cancelled: " +
+                    "replacement was already spawned " +
+                    "for the current break." +
+                    " | BrokenCount=" +
+                    currentBrokenCount);
+
+                return;
+            }
+
+            Vector3 checkpointPosition;
+            Quaternion checkpointRotation;
+
+            if (!EggCheckpoint.TryGetCheckpoint(
+                    out checkpointPosition,
+                    out checkpointRotation))
+            {
+                Logger.LogWarning(
+                    LogPrefix +
+                    "Spawn cancelled: " +
+                    "no checkpoint has been saved.");
+
+                return;
+            }
+
+            /*
+             * 현재 맵에 살아 있는 NestEgg가 하나라도 있으면
+             * 중복 생성을 막습니다.
+             */
+            Item existingNestEgg;
+
+            if (TryFindExistingNestEgg(
+                    out existingNestEgg))
+            {
+                Logger.LogWarning(
+                    LogPrefix +
+                    "Spawn cancelled: " +
+                    "an existing NestEgg was found." +
+                    " | Object=" +
+                    existingNestEgg.gameObject.name +
+                    " | Position=" +
+                    existingNestEgg.transform.position);
+
+                return;
+            }
+
+            GameObject spawnedObject;
+
+            try
+            {
+                spawnedObject =
+                    PhotonNetwork.InstantiateItemRoom(
+                        TargetPrefabName,
+                        checkpointPosition,
+                        checkpointRotation);
+            }
+            catch (System.Exception exception)
+            {
+                Logger.LogError(
+                    LogPrefix +
+                    "Photon spawn failed." +
+                    " | Exception=" +
+                    exception);
+
+                return;
+            }
+
+            if (spawnedObject == null)
+            {
+                Logger.LogError(
+                    LogPrefix +
+                    "Photon spawn returned null.");
+
+                return;
+            }
+
+            PhotonView spawnedView =
+                spawnedObject.GetComponent<PhotonView>();
+
+            if (spawnedView == null)
+            {
+                Logger.LogError(
+                    LogPrefix +
+                    "Spawned NestEgg has no PhotonView.");
+
+                /*
+                 * 네트워크 오브젝트인데 PhotonView가 없으면
+                 * 정상 동기화할 수 없으므로 호스트가 제거합니다.
+                 */
+                PhotonNetwork.Destroy(
+                    spawnedObject);
+
+                return;
+            }
+
+            /*
+             * RPC가 다른 플레이어에게 전달되기 전에
+             * 호스트 화면에서도 즉시 정확한 위치로 고정합니다.
+             */
+            spawnedObject.transform.SetPositionAndRotation(
+                checkpointPosition,
+                checkpointRotation);
+
+            Rigidbody spawnedRigidbody =
+                spawnedObject.GetComponent<Rigidbody>();
+
+            if (spawnedRigidbody != null)
+            {
+                spawnedRigidbody.linearVelocity =
+                    Vector3.zero;
+
+                spawnedRigidbody.angularVelocity =
+                    Vector3.zero;
+
+                spawnedRigidbody.isKinematic =
+                    true;
+
+                spawnedRigidbody.Sleep();
+            }
+
+            /*
+             * 모든 플레이어 화면에서 NestEgg를 Kinematic으로 고정합니다.
+             *
+             * 플레이어가 직접 집으면 원본 PEAK의 픽업 처리가
+             * 지상 NestEgg를 제거하고 손에 드는 아이템으로 전환합니다.
+             */
+            spawnedView.RPC(
+                "SetKinematicRPC",
+                RpcTarget.AllBuffered,
+                new object[]
+                {
+                    true,
+                    checkpointPosition,
+                    checkpointRotation
+                });
+
+            handledBrokenEggCount =
+                currentBrokenCount;
+
+            Logger.LogWarning(
+                LogPrefix +
+                "Replacement NestEgg spawned at checkpoint." +
+                " | BrokenCount=" +
+                currentBrokenCount +
+                " | CheckpointNumber=" +
+                EggCheckpoint.CheckpointNumber +
+                " | Position=" +
+                checkpointPosition +
+                " | ViewID=" +
+                spawnedView.ViewID);
+        }
+
+        /// <summary>
+        /// 활성화된 현재 씬 오브젝트 중
+        /// 실제 NestEgg Item을 찾습니다.
+        ///
+        /// 이 검사는 Y키를 눌렀을 때만 실행되므로
+        /// 매 프레임 전체 아이템을 검색하지 않습니다.
+        /// </summary>
+        private static bool TryFindExistingNestEgg(
+            out Item foundItem)
+        {
+            foundItem =
+                null;
+
+            Item[] allItems =
+                UnityEngine.Object.FindObjectsOfType<Item>();
+
+            if (allItems == null ||
+                allItems.Length == 0)
+            {
+                return false;
+            }
+
+            for (int i = 0;
+                 i < allItems.Length;
+                 i++)
+            {
+                Item currentItem =
+                    allItems[i];
+
+                if (currentItem == null ||
+                    currentItem.gameObject == null ||
+                    !currentItem.gameObject.activeInHierarchy)
+                {
+                    continue;
+                }
+
+                if (!currentItem.gameObject.scene.IsValid())
+                {
+                    continue;
+                }
+
+                if (!EggCheckpoint.IsNestEgg(
+                        currentItem))
+                {
+                    continue;
+                }
+
+                foundItem =
+                    currentItem;
+
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 씬이 바뀌면 이전 맵의 파손 처리 상태를 초기화합니다.
+        /// </summary>
+        private static void ResetWhenSceneChanged()
+        {
+            Scene activeScene =
+                SceneManager.GetActiveScene();
+
+            if (currentSceneHandle ==
+                activeScene.handle)
+            {
+                /*
+                 * EggCheckpoint가 현재 씬 데이터를 초기화한 경우
+                 * YSpawn의 처리 횟수도 함께 초기화합니다.
+                 */
+                if (EggCheckpoint.BrokenEggCount <
+                    handledBrokenEggCount)
+                {
+                    handledBrokenEggCount =
+                        0;
+                }
+
+                return;
+            }
+
+            currentSceneHandle =
+                activeScene.handle;
+
+            handledBrokenEggCount =
+                0;
+
+            lastProcessedFrame =
+                -1;
+
+            nextAllowedInputTime =
+                0f;
+
+            Logger.LogInfo(
+                LogPrefix +
+                "Scene changed. " +
+                "Y spawn state reset." +
+                " | Scene=" +
+                activeScene.name);
+        }
+    }
+}
