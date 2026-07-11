@@ -1,0 +1,318 @@
+using System;
+using BepInEx.Logging;
+using HarmonyLib;
+using UnityEngine;
+
+namespace Sapphire009.WatchEgg
+{
+    /// <summary>
+    /// NestEgg가 로컬 플레이어 또는 다른 플레이어의 몸에
+    /// 충돌했을 때 깨지는 것을 방지합니다.
+    ///
+    /// 플레이어와의 물리 충돌 자체는 유지되지만,
+    /// Breakable.OnCollisionEnter의 파손 처리만 건너뜁니다.
+    ///
+    /// 지형, 바닥, 벽, 바위, 일반 오브젝트에 충돌한 경우에는
+    /// PEAK 원본 파손 조건이 그대로 실행됩니다.
+    ///
+    /// Developer: Sapphire009
+    /// File: NoBody.cs
+    /// </summary>
+    [HarmonyPatch(
+        typeof(Breakable),
+        "OnCollisionEnter")]
+    public static class NoBody
+    {
+        public const string DeveloperName =
+            "Sapphire009";
+
+        public const string TargetPrefabName =
+            "NestEgg";
+
+        private const string LogPrefix =
+            "[NoBody] ";
+
+        private static readonly ManualLogSource Logger =
+            BepInEx.Logging.Logger.CreateLogSource(
+                "WatchEgg.NoBody");
+
+        /// <summary>
+        /// Harmony 패치 등록 여부를 확인합니다.
+        /// </summary>
+        [HarmonyPrepare]
+        private static bool Prepare()
+        {
+            Logger.LogInfo(
+                LogPrefix +
+                "PATCH READY: Breakable.OnCollisionEnter");
+
+            return true;
+        }
+
+        /// <summary>
+        /// Breakable의 원본 충돌 파손 로직이 실행되기 전에
+        /// 충돌 상대가 플레이어인지 검사합니다.
+        ///
+        /// true:
+        /// 원본 OnCollisionEnter 실행
+        ///
+        /// false:
+        /// 플레이어 몸 충돌이므로 원본 파손 처리 생략
+        /// </summary>
+        [HarmonyPrefix]
+        private static bool Prefix(
+            Breakable __instance,
+            Collision collision)
+        {
+            if (__instance == null ||
+                collision == null)
+            {
+                return true;
+            }
+
+            Item eggItem =
+                FindItem(
+                    __instance.gameObject);
+
+            /*
+             * NestEgg가 아닌 다른 깨지는 아이템에는
+             * 아무 영향도 주지 않습니다.
+             */
+            if (!IsNestEgg(
+                    eggItem))
+            {
+                return true;
+            }
+
+            Character collidedCharacter;
+
+            if (!TryGetCollidedCharacter(
+                    collision,
+                    out collidedCharacter))
+            {
+                /*
+                 * 충돌 대상이 플레이어가 아니므로
+                 * 바닥, 벽, 지형지물에 대한 원본 파손 판정을 허용합니다.
+                 */
+                return true;
+            }
+
+            /*
+             * 플레이어와의 물리 충돌은 그대로 발생합니다.
+             *
+             * 원본 Breakable.OnCollisionEnter만 실행하지 않으므로
+             * NestEgg가 튕기거나 플레이어 몸에 닿는 물리 반응은
+             * 유지되면서 파손만 방지됩니다.
+             */
+            Logger.LogInfo(
+                LogPrefix +
+                "NestEgg body collision ignored." +
+                " | Player=" +
+                GetCharacterName(
+                    collidedCharacter) +
+                " | RelativeVelocity=" +
+                collision.relativeVelocity.magnitude +
+                " | Collider=" +
+                GetColliderName(
+                    collision));
+
+            return false;
+        }
+
+        /// <summary>
+        /// 충돌한 Collider 또는 Rigidbody의 상위 계층에서
+        /// Character를 찾습니다.
+        ///
+        /// 로컬 플레이어와 원격 플레이어를 구분하지 않고
+        /// 모든 플레이어 몸 충돌을 차단합니다.
+        /// </summary>
+        private static bool TryGetCollidedCharacter(
+            Collision collision,
+            out Character character)
+        {
+            character =
+                null;
+
+            if (collision == null)
+            {
+                return false;
+            }
+
+            /*
+             * 실제 접촉 Collider를 우선 검사합니다.
+             *
+             * 손, 머리, 몸통, 다리처럼 Bodypart 하위 Collider가
+             * 충돌한 경우에도 상위 Character를 찾습니다.
+             */
+            if (collision.collider != null)
+            {
+                character =
+                    collision.collider
+                        .GetComponentInParent<Character>();
+
+                if (character != null)
+                {
+                    return true;
+                }
+            }
+
+            /*
+             * Collider 계층에서 찾지 못한 경우
+             * 충돌 Rigidbody 계층도 검사합니다.
+             */
+            if (collision.rigidbody != null)
+            {
+                character =
+                    collision.rigidbody
+                        .GetComponentInParent<Character>();
+
+                if (character != null)
+                {
+                    return true;
+                }
+            }
+
+            /*
+             * 마지막으로 Collision Transform 계층을 검사합니다.
+             */
+            if (collision.transform != null)
+            {
+                character =
+                    collision.transform
+                        .GetComponentInParent<Character>();
+
+                if (character != null)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Breakable 오브젝트의 직접, 부모, 자식 계층에서
+        /// Item 컴포넌트를 찾습니다.
+        /// </summary>
+        private static Item FindItem(
+            GameObject sourceObject)
+        {
+            if (sourceObject == null)
+            {
+                return null;
+            }
+
+            Item item =
+                sourceObject.GetComponent<Item>();
+
+            if (item != null)
+            {
+                return item;
+            }
+
+            item =
+                sourceObject
+                    .GetComponentInParent<Item>();
+
+            if (item != null)
+            {
+                return item;
+            }
+
+            return sourceObject
+                .GetComponentInChildren<Item>(
+                    true);
+        }
+
+        /// <summary>
+        /// 대상 Item이 실제 NestEgg인지 확인합니다.
+        /// </summary>
+        private static bool IsNestEgg(
+            Item item)
+        {
+            if (item == null ||
+                item.gameObject == null)
+            {
+                return false;
+            }
+
+            return string.Equals(
+                NormalizePrefabName(
+                    item.gameObject.name),
+                TargetPrefabName,
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Unity가 생성된 인스턴스에 붙이는
+        /// (Clone) 접미사를 제거합니다.
+        /// </summary>
+        private static string NormalizePrefabName(
+            string objectName)
+        {
+            if (string.IsNullOrEmpty(
+                    objectName))
+            {
+                return string.Empty;
+            }
+
+            string normalized =
+                objectName.Trim();
+
+            const string cloneSuffix =
+                "(Clone)";
+
+            while (normalized.EndsWith(
+                       cloneSuffix,
+                       StringComparison.OrdinalIgnoreCase))
+            {
+                normalized =
+                    normalized.Substring(
+                        0,
+                        normalized.Length -
+                        cloneSuffix.Length)
+                    .Trim();
+            }
+
+            return normalized;
+        }
+
+        private static string GetCharacterName(
+            Character character)
+        {
+            if (character == null)
+            {
+                return "Unknown";
+            }
+
+            if (character.photonView != null &&
+                character.photonView.Owner != null &&
+                !string.IsNullOrEmpty(
+                    character.photonView.Owner.NickName))
+            {
+                return character
+                    .photonView
+                    .Owner
+                    .NickName;
+            }
+
+            return character.gameObject.name;
+        }
+
+        private static string GetColliderName(
+            Collision collision)
+        {
+            if (collision == null ||
+                collision.collider == null ||
+                collision.collider.gameObject == null)
+            {
+                return "Unknown";
+            }
+
+            return collision
+                .collider
+                .gameObject
+                .name;
+        }
+    }
+}
