@@ -17,7 +17,7 @@ namespace Sapphire009.WatchEgg
     /// 2배속, 0.5초 간격
     ///
     /// 2초~0초:
-    /// 2.5배속, 0.4초 간격
+    /// 4배속, 0.25초 간격
     ///
     /// 별도의 경고음은 사용하지 않고
     /// 기존 Tick/Tock 소리의 재생 간격만 변경합니다.
@@ -38,7 +38,7 @@ namespace Sapphire009.WatchEgg
             5f;
 
         /// <summary>
-        /// 2.5배속 구간이 시작되는 남은 시간입니다.
+        /// 4배속 구간이 시작되는 남은 시간입니다.
         /// </summary>
         public const float FinalSpeedStartRemainingTime =
             2f;
@@ -65,12 +65,12 @@ namespace Sapphire009.WatchEgg
         /// <summary>
         /// 2초~0초 구간의 째깍 소리 간격입니다.
         ///
-        /// 속도 2.5:
-        /// 0.4초마다 한 번 재생합니다.
+        /// 속도 4:
+        /// 0.25초마다 한 번 재생합니다.
         /// </summary>
         private const float FinalSpeedTickInterval =
             NormalTickInterval /
-            2.5f;
+            4f;
 
         /// <summary>
         /// 평상시 소리 크기입니다.
@@ -112,7 +112,7 @@ namespace Sapphire009.WatchEgg
         private bool doubleSpeedPhaseStarted;
 
         /// <summary>
-        /// 2초 이하 2.5배속 구간에 진입했는지 기록합니다.
+        /// 2초 이하 4배속 구간에 진입했는지 기록합니다.
         /// </summary>
         private bool finalSpeedPhaseStarted;
 
@@ -238,7 +238,7 @@ namespace Sapphire009.WatchEgg
 
             /*
              * 남은 시간이 2초 이하가 되는 순간
-             * 2.5배속 구간으로 전환합니다.
+             * 4배속 구간으로 전환합니다.
              */
             if (remainingTime <=
                     FinalSpeedStartRemainingTime &&
@@ -248,7 +248,7 @@ namespace Sapphire009.WatchEgg
                     true;
 
                 /*
-                 * 2.5배속 구간 진입 순간에도
+                 * 4배속 구간 진입 순간에도
                  * 다음 Tick이 즉시 반응하도록 합니다.
                  */
                 nextTickHeldTime =
@@ -261,7 +261,7 @@ namespace Sapphire009.WatchEgg
                     "Final-speed phase started." +
                     " | RemainingTime=" +
                     remainingTime.ToString("F2") +
-                    " | Speed=2.5" +
+                    " | Speed=4.0" +
                     " | Interval=" +
                     FinalSpeedTickInterval);
             }
@@ -395,7 +395,7 @@ namespace Sapphire009.WatchEgg
         /// 0.5초 간격, 속도 2
         ///
         /// 2초 이하:
-        /// 0.4초 간격, 속도 2.5
+        /// 0.25초 간격, 속도 4
         /// </summary>
         private static float CalculateTickInterval(
             float remainingTime)
