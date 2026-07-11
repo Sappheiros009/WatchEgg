@@ -1,0 +1,522 @@
+using System;
+using System.Collections.Generic;
+using BepInEx.Logging;
+using HarmonyLib;
+using UnityEngine;
+
+namespace Sapphire009.WatchEgg
+{
+    /// <summary>
+    /// 꺼진 모닥불을 켜기 위해서는 NestEgg가
+    /// 모닥불 반경 15 유닛 안에 있어야 합니다.
+    ///
+    /// 달걀은 플레이어가 손에 들고 있거나,
+    /// 모닥불 근처 바닥에 놓여 있어도 인정됩니다.
+    ///
+    /// 달걀이 멀리 있거나 존재하지 않으면
+    /// 모닥불 점화를 차단합니다.
+    ///
+    /// 이미 켜진 모닥불에서 음식을 조리하는 기능에는
+    /// 영향을 주지 않습니다.
+    ///
+    /// Developer: Sapphire009
+    /// File: WithEgg.cs
+    /// </summary>
+    public static class WithEgg
+    {
+        public const string DeveloperName =
+            "Sapphire009";
+
+        public const string TargetPrefabName =
+            "NestEgg";
+
+        /// <summary>
+        /// 모닥불 점화가 허용되는 달걀의 최대 거리입니다.
+        ///
+        /// PEAK 원본의 플레이어 모닥불 집결 범위와 동일한
+        /// 15 유닛으로 설정했습니다.
+        /// </summary>
+        public const float RequiredEggRange =
+            15f;
+
+        private const string RequirementText =
+            "BRING THE EGG TO THE CAMPFIRE";
+
+        private const string LogPrefix =
+            "[WithEgg] ";
+
+        private static readonly ManualLogSource Logger =
+            BepInEx.Logging.Logger.CreateLogSource(
+                "WatchEgg.WithEgg");
+
+        /// <summary>
+        /// 현재 씬에 존재하는 NestEgg 인스턴스 목록입니다.
+        ///
+        /// 모닥불을 바라볼 때마다 모든 Item을 검색하지 않도록
+        /// Item.Awake 시점에 달걀만 등록합니다.
+        /// </summary>
+        private static readonly List<Item> ActiveNestEggs =
+            new List<Item>();
+
+        /// <summary>
+        /// 새로 생성된 NestEgg를 목록에 등록합니다.
+        /// </summary>
+        private static void RegisterNestEgg(
+            Item item)
+        {
+            if (!IsNestEgg(
+                    item))
+            {
+                return;
+            }
+
+            if (!ActiveNestEggs.Contains(
+                    item))
+            {
+                ActiveNestEggs.Add(
+                    item);
+            }
+
+            WithEggTracker tracker =
+                item.GetComponent<WithEggTracker>();
+
+            if (tracker == null)
+            {
+                tracker =
+                    item.gameObject
+                        .AddComponent<WithEggTracker>();
+            }
+
+            tracker.Initialize(
+                item);
+
+            Logger.LogInfo(
+                LogPrefix +
+                "NestEgg registered." +
+                " | Object=" +
+                item.gameObject.name);
+        }
+
+        /// <summary>
+        /// 파괴된 NestEgg를 목록에서 제거합니다.
+        /// </summary>
+        internal static void UnregisterNestEgg(
+            Item item)
+        {
+            for (int i = ActiveNestEggs.Count - 1;
+                 i >= 0;
+                 i--)
+            {
+                Item registeredItem =
+                    ActiveNestEggs[i];
+
+                if (registeredItem == null ||
+                    registeredItem == item)
+                {
+                    ActiveNestEggs.RemoveAt(
+                        i);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 모닥불 주변에 NestEgg가 있는지 확인합니다.
+        ///
+        /// 1. 플레이어가 손에 들고 있는 달걀
+        /// 2. 월드 바닥에 놓여 있는 활성 달걀
+        ///
+        /// 두 경우를 모두 검사합니다.
+        /// </summary>
+        private static bool IsNestEggInCampfireRange(
+            Campfire campfire,
+            out float nearestDistance)
+        {
+            nearestDistance =
+                float.PositiveInfinity;
+
+            if (campfire == null)
+            {
+                return false;
+            }
+
+            Vector3 campfirePosition =
+                campfire.transform.position;
+
+            /*
+             * 플레이어가 현재 손에 들고 있는 NestEgg를 먼저 검사합니다.
+             *
+             * 손에 든 아이템 오브젝트가 일시적으로 비활성화되는
+             * 경우에도 플레이어의 currentItem을 통해 감지합니다.
+             */
+            if (PlayerHandler.GetAllPlayerCharacters() !=
+                null)
+            {
+                foreach (
+                    Character character
+                    in PlayerHandler.GetAllPlayerCharacters())
+                {
+                    if (character == null ||
+                        character.data == null)
+                    {
+                        continue;
+                    }
+
+                    Item heldItem =
+                        character.data.currentItem;
+
+                    if (!IsNestEgg(
+                            heldItem))
+                    {
+                        continue;
+                    }
+
+                    float heldEggDistance =
+                        Vector3.Distance(
+                            campfirePosition,
+                            character.Center);
+
+                    if (heldEggDistance <
+                        nearestDistance)
+                    {
+                        nearestDistance =
+                            heldEggDistance;
+                    }
+
+                    if (heldEggDistance <=
+                        RequiredEggRange)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            /*
+             * 바닥에 떨어져 있거나 던져진 NestEgg를 검사합니다.
+             */
+            for (int i = ActiveNestEggs.Count - 1;
+                 i >= 0;
+                 i--)
+            {
+                Item eggItem =
+                    ActiveNestEggs[i];
+
+                /*
+                 * 씬 전환이나 파손으로 제거된 항목을 정리합니다.
+                 */
+                if (eggItem == null ||
+                    eggItem.gameObject == null)
+                {
+                    ActiveNestEggs.RemoveAt(
+                        i);
+
+                    continue;
+                }
+
+                if (!IsNestEgg(
+                        eggItem))
+                {
+                    ActiveNestEggs.RemoveAt(
+                        i);
+
+                    continue;
+                }
+
+                /*
+                 * 손에 든 달걀은 위에서 플레이어 위치 기준으로
+                 * 이미 검사했습니다.
+                 */
+                if (eggItem.itemState ==
+                    ItemState.Held)
+                {
+                    continue;
+                }
+
+                if (!eggItem.gameObject
+                        .activeInHierarchy)
+                {
+                    continue;
+                }
+
+                float worldEggDistance =
+                    Vector3.Distance(
+                        campfirePosition,
+                        eggItem.transform.position);
+
+                if (worldEggDistance <
+                    nearestDistance)
+                {
+                    nearestDistance =
+                        worldEggDistance;
+                }
+
+                if (worldEggDistance <=
+                    RequiredEggRange)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 대상 Item이 PEAK의 NestEgg인지 확인합니다.
+        /// </summary>
+        private static bool IsNestEgg(
+            Item item)
+        {
+            if (item == null ||
+                item.gameObject == null)
+            {
+                return false;
+            }
+
+            return string.Equals(
+                NormalizePrefabName(
+                    item.gameObject.name),
+                TargetPrefabName,
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string NormalizePrefabName(
+            string objectName)
+        {
+            if (string.IsNullOrWhiteSpace(
+                    objectName))
+            {
+                return string.Empty;
+            }
+
+            string normalized =
+                objectName.Trim();
+
+            const string cloneSuffix =
+                "(Clone)";
+
+            while (normalized.EndsWith(
+                       cloneSuffix,
+                       StringComparison.OrdinalIgnoreCase))
+            {
+                normalized =
+                    normalized.Substring(
+                        0,
+                        normalized.Length -
+                        cloneSuffix.Length)
+                    .Trim();
+            }
+
+            return normalized;
+        }
+
+        /// <summary>
+        /// 현재 씬에 생성되는 모든 NestEgg를 등록합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            "Awake")]
+        private static class ItemAwakePatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(
+                Item __instance)
+            {
+                RegisterNestEgg(
+                    __instance);
+            }
+        }
+
+        /// <summary>
+        /// 모닥불을 바라봤을 때 달걀이 범위 밖에 있으면
+        /// 기존 상호작용 문구 위에 달걀 요구 조건을 표시합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Campfire),
+            nameof(Campfire.GetInteractionText))]
+        private static class CampfireGetInteractionTextPatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(
+                Campfire __instance,
+                ref string __result)
+            {
+                if (__instance == null ||
+                    __instance.Lit)
+                {
+                    return;
+                }
+
+                float nearestDistance;
+
+                if (IsNestEggInCampfireRange(
+                        __instance,
+                        out nearestDistance))
+                {
+                    return;
+                }
+
+                if (string.IsNullOrEmpty(
+                        __result))
+                {
+                    __result =
+                        RequirementText;
+
+                    return;
+                }
+
+                __result =
+                    RequirementText +
+                    "\n" +
+                    __result;
+            }
+        }
+
+        /// <summary>
+        /// 모닥불 점화가 완료되는 최종 시점에서
+        /// NestEgg 거리 조건을 다시 검사합니다.
+        ///
+        /// 상호작용을 시작한 뒤 누군가 달걀을 멀리 가져간 경우에도
+        /// 실제 Light_Rpc가 전송되지 않도록 차단합니다.
+        ///
+        /// 이미 불이 켜져 있으면 원본 조리 기능을 그대로 허용합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Campfire),
+            nameof(Campfire.Interact_CastFinished))]
+        private static class CampfireInteractCastFinishedPatch
+        {
+            [HarmonyPrepare]
+            private static bool Prepare()
+            {
+                Logger.LogInfo(
+                    LogPrefix +
+                    "PATCH READY: " +
+                    "Campfire.Interact_CastFinished" +
+                    " | RequiredEggRange=" +
+                    RequiredEggRange);
+
+                return true;
+            }
+
+            [HarmonyPrefix]
+            private static bool Prefix(
+                Campfire __instance,
+                Character interactor)
+            {
+                if (__instance == null)
+                {
+                    return true;
+                }
+
+                /*
+                 * 이미 켜진 모닥불에서는 음식 조리 로직을
+                 * 방해하지 않습니다.
+                 */
+                if (__instance.Lit)
+                {
+                    return true;
+                }
+
+                float nearestDistance;
+
+                if (IsNestEggInCampfireRange(
+                        __instance,
+                        out nearestDistance))
+                {
+                    Logger.LogInfo(
+                        LogPrefix +
+                        "Campfire lighting allowed." +
+                        " | EggDistance=" +
+                        nearestDistance +
+                        " | Campfire=" +
+                        __instance.gameObject.name);
+
+                    return true;
+                }
+
+                string playerName =
+                    GetCharacterName(
+                        interactor);
+
+                string distanceText =
+                    float.IsPositiveInfinity(
+                        nearestDistance)
+                        ? "No NestEgg found"
+                        : nearestDistance.ToString(
+                            "F2");
+
+                Logger.LogWarning(
+                    LogPrefix +
+                    "Campfire lighting blocked. " +
+                    "Bring the NestEgg closer." +
+                    " | Player=" +
+                    playerName +
+                    " | NearestEggDistance=" +
+                    distanceText +
+                    " | RequiredRange=" +
+                    RequiredEggRange +
+                    " | Campfire=" +
+                    __instance.gameObject.name);
+
+                if (GUIManager.instance != null)
+                {
+                    GUIManager.instance
+                        .RefreshInteractablePrompt();
+                }
+
+                /*
+                 * 원본 Interact_CastFinished 실행을 막아
+                 * Light_Rpc가 전송되지 않도록 합니다.
+                 */
+                return false;
+            }
+        }
+
+        private static string GetCharacterName(
+            Character character)
+        {
+            if (character == null)
+            {
+                return "Unknown";
+            }
+
+            if (character.photonView != null &&
+                character.photonView.Owner != null &&
+                !string.IsNullOrEmpty(
+                    character.photonView.Owner.NickName))
+            {
+                return character
+                    .photonView
+                    .Owner
+                    .NickName;
+            }
+
+            return character.gameObject.name;
+        }
+    }
+
+    /// <summary>
+    /// NestEgg가 파괴되거나 씬에서 제거될 때
+    /// WithEgg의 활성 달걀 목록에서 제거하기 위한 추적 컴포넌트입니다.
+    /// </summary>
+    [DisallowMultipleComponent]
+    public sealed class WithEggTracker : MonoBehaviour
+    {
+        private Item trackedItem;
+
+        public void Initialize(
+            Item item)
+        {
+            trackedItem =
+                item;
+        }
+
+        private void OnDestroy()
+        {
+            WithEgg.UnregisterNestEgg(
+                trackedItem);
+
+            trackedItem =
+                null;
+        }
+    }
+}
