@@ -1,0 +1,276 @@
+using BepInEx.Logging;
+using HarmonyLib;
+using UnityEngine;
+
+namespace Sapphire009.WatchEgg
+{
+    /// <summary>
+    /// 화면 하단 중앙에 현재 NestEgg 파손 횟수를 표시합니다.
+    ///
+    /// EggCheckpoint.BrokenEggCount 값을 실시간으로 읽으며,
+    /// 씬이 변경되어 EggCheckpoint가 초기화되면 UI 숫자도 자동으로
+    /// 0으로 돌아갑니다.
+    ///
+    /// Developer: Sapphire009
+    /// File: CountUI.cs
+    /// </summary>
+    [DisallowMultipleComponent]
+    public sealed class CountUI : MonoBehaviour
+    {
+        public const string DeveloperName =
+            "Sapphire009";
+
+        private const string LogPrefix =
+            "[CountUI] ";
+
+        private const float ReferenceScreenHeight =
+            1080f;
+
+        private const float ReferenceWidth =
+            360f;
+
+        private const float ReferenceHeight =
+            48f;
+
+        private const float ReferenceBottomMargin =
+            115f;
+
+        private static readonly ManualLogSource Logger =
+            BepInEx.Logging.Logger.CreateLogSource(
+                "WatchEgg.CountUI");
+
+        private static CountUI instance;
+
+        private GUIStyle textStyle;
+        private GUIStyle shadowStyle;
+
+        private int cachedFontSize =
+            -1;
+
+        private void Awake()
+        {
+            if (instance != null &&
+                instance != this)
+            {
+                Destroy(gameObject);
+                return;
+            }
+
+            instance =
+                this;
+
+            UnityEngine.Object.DontDestroyOnLoad(
+                gameObject);
+
+            Logger.LogInfo(
+                LogPrefix +
+                "Broken egg counter UI created.");
+        }
+
+        private void OnDestroy()
+        {
+            if (instance == this)
+            {
+                instance =
+                    null;
+            }
+        }
+
+        private void OnGUI()
+        {
+            if (!ShouldDisplay())
+            {
+                return;
+            }
+
+            PrepareStyles();
+
+            float screenScale =
+                Mathf.Clamp(
+                    Screen.height /
+                    ReferenceScreenHeight,
+                    0.75f,
+                    1.5f);
+
+            float width =
+                ReferenceWidth *
+                screenScale;
+
+            float height =
+                ReferenceHeight *
+                screenScale;
+
+            float x =
+                (
+                    Screen.width -
+                    width
+                ) *
+                0.5f;
+
+            float y =
+                Screen.height -
+                (
+                    ReferenceBottomMargin *
+                    screenScale
+                ) -
+                height;
+
+            Rect textRect =
+                new Rect(
+                    x,
+                    y,
+                    width,
+                    height);
+
+            string countText =
+                "BROKEN EGGS : " +
+                EggCheckpoint.BrokenEggCount;
+
+            /*
+             * 검은 그림자를 먼저 그린 후
+             * 흰색 본문을 겹쳐서 가독성을 높입니다.
+             */
+            Rect shadowRect =
+                new Rect(
+                    textRect.x + 2f * screenScale,
+                    textRect.y + 2f * screenScale,
+                    textRect.width,
+                    textRect.height);
+
+            GUI.Label(
+                shadowRect,
+                countText,
+                shadowStyle);
+
+            GUI.Label(
+                textRect,
+                countText,
+                textStyle);
+        }
+
+        /// <summary>
+        /// 로컬 캐릭터와 NestEgg 체크포인트가 존재할 때만
+        /// 파손 횟수 UI를 표시합니다.
+        /// </summary>
+        private static bool ShouldDisplay()
+        {
+            Character localCharacter =
+                Character.localCharacter;
+
+            if (localCharacter == null ||
+                !localCharacter.IsLocal)
+            {
+                return false;
+            }
+
+            /*
+             * NestEgg가 아직 생성되지 않은 로비에서는 숨깁니다.
+             *
+             * 달걀이 깨진 뒤에는 HasCheckpoint가 유지되므로
+             * 새로운 달걀을 생성하기 전에도 카운터가 계속 표시됩니다.
+             */
+            if (!EggCheckpoint.HasCheckpoint &&
+                EggCheckpoint.BrokenEggCount <= 0)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// 현재 해상도에 맞춰 GUI 글꼴 크기를 준비합니다.
+        /// </summary>
+        private void PrepareStyles()
+        {
+            int fontSize =
+                Mathf.RoundToInt(
+                    Mathf.Clamp(
+                        Screen.height /
+                        ReferenceScreenHeight *
+                        26f,
+                        19f,
+                        34f));
+
+            if (textStyle != null &&
+                shadowStyle != null &&
+                cachedFontSize == fontSize)
+            {
+                return;
+            }
+
+            cachedFontSize =
+                fontSize;
+
+            textStyle =
+                new GUIStyle(
+                    GUI.skin.label);
+
+            textStyle.alignment =
+                TextAnchor.MiddleCenter;
+
+            textStyle.fontSize =
+                fontSize;
+
+            textStyle.fontStyle =
+                FontStyle.Bold;
+
+            textStyle.normal.textColor =
+                Color.white;
+
+            textStyle.wordWrap =
+                false;
+
+            textStyle.clipping =
+                TextClipping.Overflow;
+
+            shadowStyle =
+                new GUIStyle(
+                    textStyle);
+
+            shadowStyle.normal.textColor =
+                new Color(
+                    0f,
+                    0f,
+                    0f,
+                    0.9f);
+        }
+
+        /// <summary>
+        /// CountUI 오브젝트가 없으면 한 번만 생성합니다.
+        /// </summary>
+        private static void EnsureCountUIExists()
+        {
+            if (instance != null)
+            {
+                return;
+            }
+
+            GameObject countUIObject =
+                new GameObject(
+                    "WatchEgg_BrokenEgg_CountUI");
+
+            countUIObject
+                .AddComponent<CountUI>();
+        }
+
+        /// <summary>
+        /// CharacterSpawner가 동작하는 동안 CountUI가 존재하는지
+        /// 확인합니다.
+        ///
+        /// 별도로 WatchEgg.cs를 수정하지 않아도
+        /// Harmony.PatchAll()을 통해 자동 등록됩니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(CharacterSpawner),
+            "Update")]
+        private static class CharacterSpawnerUpdatePatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix()
+            {
+                EnsureCountUIExists();
+            }
+        }
+    }
+}
