@@ -1,0 +1,649 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using BepInEx.Logging;
+using HarmonyLib;
+using UnityEngine;
+
+namespace Sapphire009.WatchEgg
+{
+    /// <summary>
+    /// NestEgg가 깨지면서 생성된 음식 아이템만 식용 불가 상태로 만듭니다.
+    ///
+    /// 기존 맵에 원래 존재하던 같은 종류의 음식은 막지 않습니다.
+    /// NestEgg 파손 직후 해당 위치에서 생성된 아이템 인스턴스에만
+    /// NoEatMarker를 부착합니다.
+    ///
+    /// Developer: Sapphire009
+    /// File: NoEat.cs
+    /// </summary>
+    public static class NoEat
+    {
+        private const string LogPrefix =
+            "[NoEat] ";
+
+        private const string TargetPrefabName =
+            "NestEgg";
+
+        private const float PendingLifetime =
+            4f;
+
+        private const float SpawnDetectionRadius =
+            6f;
+
+        private static readonly ManualLogSource Logger =
+            BepInEx.Logging.Logger.CreateLogSource(
+                "WatchEgg.NoEat");
+
+        private static readonly List<PendingNestEggBreak>
+            PendingBreaks =
+                new List<PendingNestEggBreak>();
+
+        /// <summary>
+        /// NestEgg 파손 위치와 파손 시 생성될 수 있는
+        /// 아이템 정보를 임시로 저장합니다.
+        /// </summary>
+        private sealed class PendingNestEggBreak
+        {
+            public Vector3 BreakPosition;
+
+            public float ExpireTime;
+
+            public readonly HashSet<ushort> ItemIDs =
+                new HashSet<ushort>();
+
+            public readonly HashSet<string> ObjectNames =
+                new HashSet<string>(
+                    StringComparer.OrdinalIgnoreCase);
+
+            public readonly HashSet<string> ItemNames =
+                new HashSet<string>(
+                    StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Breakable이 NestEgg에 속하는지 확인합니다.
+        /// </summary>
+        private static bool IsNestEggBreakable(
+            Breakable breakable,
+            out Item eggItem)
+        {
+            eggItem =
+                null;
+
+            if (breakable == null)
+            {
+                return false;
+            }
+
+            eggItem =
+                FindItem(
+                    breakable.gameObject);
+
+            if (eggItem == null)
+            {
+                return false;
+            }
+
+            string objectName =
+                NormalizeObjectName(
+                    eggItem.gameObject.name);
+
+            return string.Equals(
+                objectName,
+                TargetPrefabName,
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// 지정된 오브젝트의 직접, 부모, 자식 계층에서
+        /// Item 컴포넌트를 찾습니다.
+        /// </summary>
+        private static Item FindItem(
+            GameObject sourceObject)
+        {
+            if (sourceObject == null)
+            {
+                return null;
+            }
+
+            Item item =
+                sourceObject.GetComponent<Item>();
+
+            if (item != null)
+            {
+                return item;
+            }
+
+            item =
+                sourceObject.GetComponentInParent<Item>();
+
+            if (item != null)
+            {
+                return item;
+            }
+
+            return sourceObject
+                .GetComponentInChildren<Item>(true);
+        }
+
+        /// <summary>
+        /// Breakable의 생성 목록에서 생성될 수 있는
+        /// 아이템 ID와 이름을 등록합니다.
+        /// </summary>
+        private static void RegisterSpawnList(
+            List<GameObject> spawnList,
+            PendingNestEggBreak pendingBreak)
+        {
+            if (spawnList == null ||
+                pendingBreak == null)
+            {
+                return;
+            }
+
+            for (int i = 0;
+                 i < spawnList.Count;
+                 i++)
+            {
+                GameObject spawnPrefab =
+                    spawnList[i];
+
+                if (spawnPrefab == null)
+                {
+                    continue;
+                }
+
+                Item spawnItem =
+                    FindItem(
+                        spawnPrefab);
+
+                if (spawnItem == null)
+                {
+                    continue;
+                }
+
+                pendingBreak.ItemIDs.Add(
+                    spawnItem.itemID);
+
+                AddObjectName(
+                    pendingBreak,
+                    spawnPrefab.name);
+
+                AddObjectName(
+                    pendingBreak,
+                    spawnItem.gameObject.name);
+
+                if (spawnItem.UIData != null)
+                {
+                    AddItemName(
+                        pendingBreak,
+                        spawnItem.UIData.itemName);
+                }
+            }
+        }
+
+        private static void AddObjectName(
+            PendingNestEggBreak pendingBreak,
+            string objectName)
+        {
+            string normalizedName =
+                NormalizeObjectName(
+                    objectName);
+
+            if (string.IsNullOrEmpty(
+                    normalizedName))
+            {
+                return;
+            }
+
+            pendingBreak.ObjectNames.Add(
+                normalizedName);
+        }
+
+        private static void AddItemName(
+            PendingNestEggBreak pendingBreak,
+            string itemName)
+        {
+            if (string.IsNullOrWhiteSpace(
+                    itemName))
+            {
+                return;
+            }
+
+            pendingBreak.ItemNames.Add(
+                itemName.Trim());
+        }
+
+        /// <summary>
+        /// NestEgg 파손 직후 생성된 아이템인지 검사합니다.
+        /// </summary>
+        private static bool MatchesPendingBreak(
+            Item item,
+            PendingNestEggBreak pendingBreak)
+        {
+            if (item == null ||
+                pendingBreak == null)
+            {
+                return false;
+            }
+
+            float distance =
+                Vector3.Distance(
+                    item.transform.position,
+                    pendingBreak.BreakPosition);
+
+            if (distance >
+                SpawnDetectionRadius)
+            {
+                return false;
+            }
+
+            if (pendingBreak.ItemIDs.Contains(
+                    item.itemID))
+            {
+                return true;
+            }
+
+            string objectName =
+                NormalizeObjectName(
+                    item.gameObject.name);
+
+            if (pendingBreak.ObjectNames.Contains(
+                    objectName))
+            {
+                return true;
+            }
+
+            if (item.UIData != null &&
+                !string.IsNullOrWhiteSpace(
+                    item.UIData.itemName) &&
+                pendingBreak.ItemNames.Contains(
+                    item.UIData.itemName.Trim()))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// NestEgg에서 생성된 음식에 식용 금지 마커를 붙입니다.
+        /// </summary>
+        private static void TryMarkSpawnedItem(
+            Item item)
+        {
+            if (item == null)
+            {
+                return;
+            }
+
+            RemoveExpiredBreakRecords();
+
+            if (PendingBreaks.Count == 0)
+            {
+                return;
+            }
+
+            if (item.GetComponent<NoEatMarker>() != null)
+            {
+                return;
+            }
+
+            for (int i = PendingBreaks.Count - 1;
+                 i >= 0;
+                 i--)
+            {
+                PendingNestEggBreak pendingBreak =
+                    PendingBreaks[i];
+
+                if (!MatchesPendingBreak(
+                        item,
+                        pendingBreak))
+                {
+                    continue;
+                }
+
+                item.gameObject
+                    .AddComponent<NoEatMarker>();
+
+                Logger.LogInfo(
+                    LogPrefix +
+                    "NestEgg spawned item marked as non-edible." +
+                    " Object=" +
+                    item.gameObject.name +
+                    " | ItemID=" +
+                    item.itemID +
+                    " | Position=" +
+                    item.transform.position);
+
+                return;
+            }
+        }
+
+        private static bool IsBlockedItem(
+            Item item)
+        {
+            if (item == null)
+            {
+                return false;
+            }
+
+            return item.GetComponent<NoEatMarker>() != null;
+        }
+
+        private static void RemoveExpiredBreakRecords()
+        {
+            float currentTime =
+                Time.time;
+
+            for (int i = PendingBreaks.Count - 1;
+                 i >= 0;
+                 i--)
+            {
+                if (PendingBreaks[i].ExpireTime >
+                    currentTime)
+                {
+                    continue;
+                }
+
+                PendingBreaks.RemoveAt(i);
+            }
+        }
+
+        private static string NormalizeObjectName(
+            string objectName)
+        {
+            if (string.IsNullOrWhiteSpace(
+                    objectName))
+            {
+                return string.Empty;
+            }
+
+            string normalizedName =
+                objectName.Trim();
+
+            const string cloneSuffix =
+                "(Clone)";
+
+            if (normalizedName.EndsWith(
+                    cloneSuffix,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                normalizedName =
+                    normalizedName.Substring(
+                        0,
+                        normalizedName.Length -
+                        cloneSuffix.Length);
+
+                normalizedName =
+                    normalizedName.Trim();
+            }
+
+            return normalizedName;
+        }
+
+        private static void LogBlocked(
+            Item item,
+            string actionName)
+        {
+            string objectName =
+                item != null
+                    ? item.gameObject.name
+                    : "null";
+
+            Logger.LogWarning(
+                LogPrefix +
+                "Consumption blocked." +
+                " Action=" +
+                actionName +
+                " | Object=" +
+                objectName);
+        }
+
+        private static IEnumerator EmptyRoutine()
+        {
+            yield break;
+        }
+
+        /// <summary>
+        /// NestEgg가 깨지기 직전에 파손 위치와
+        /// 생성 예정 아이템을 기록합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Breakable),
+            nameof(Breakable.Break))]
+        private static class BreakableBreakPatch
+        {
+            [HarmonyPrefix]
+            private static void Prefix(
+                Breakable __instance)
+            {
+                Item eggItem;
+
+                if (!IsNestEggBreakable(
+                        __instance,
+                        out eggItem))
+                {
+                    return;
+                }
+
+                RemoveExpiredBreakRecords();
+
+                PendingNestEggBreak pendingBreak =
+                    new PendingNestEggBreak();
+
+                pendingBreak.BreakPosition =
+                    eggItem.transform.position;
+
+                pendingBreak.ExpireTime =
+                    Time.time +
+                    PendingLifetime;
+
+                RegisterSpawnList(
+                    __instance.instantiateOnBreak,
+                    pendingBreak);
+
+                RegisterSpawnList(
+                    __instance.alternateInstantiateOnBreak,
+                    pendingBreak);
+
+                RegisterSpawnList(
+                    __instance.instantiateNonItemOnBreak,
+                    pendingBreak);
+
+                if (pendingBreak.ItemIDs.Count == 0 &&
+                    pendingBreak.ObjectNames.Count == 0 &&
+                    pendingBreak.ItemNames.Count == 0)
+                {
+                    Logger.LogWarning(
+                        LogPrefix +
+                        "NestEgg break detected, but no spawned Item prefab was found.");
+
+                    return;
+                }
+
+                PendingBreaks.Add(
+                    pendingBreak);
+
+                Logger.LogInfo(
+                    LogPrefix +
+                    "NestEgg break registered." +
+                    " Position=" +
+                    pendingBreak.BreakPosition +
+                    " | SpawnItemIDs=" +
+                    pendingBreak.ItemIDs.Count +
+                    " | SpawnNames=" +
+                    pendingBreak.ObjectNames.Count);
+            }
+        }
+
+        /// <summary>
+        /// 새 Item 인스턴스가 생성되면 NestEgg 파손 결과물인지
+        /// 검사하여 NoEatMarker를 부착합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            "Awake")]
+        private static class ItemAwakePatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(
+                Item __instance)
+            {
+                TryMarkSpawnedItem(
+                    __instance);
+            }
+        }
+
+        /// <summary>
+        /// 표시된 아이템의 기본 사용 시작을 막습니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            nameof(Item.StartUsePrimary))]
+        private static class StartUsePrimaryPatch
+        {
+            [HarmonyPrefix]
+            private static bool Prefix(
+                Item __instance)
+            {
+                if (!IsBlockedItem(
+                        __instance))
+                {
+                    return true;
+                }
+
+                LogBlocked(
+                    __instance,
+                    "StartUsePrimary");
+
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 표시된 아이템의 기본 사용 진행을 막습니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            nameof(Item.ContinueUsePrimary))]
+        private static class ContinueUsePrimaryPatch
+        {
+            [HarmonyPrefix]
+            private static bool Prefix(
+                Item __instance)
+            {
+                return !IsBlockedItem(
+                    __instance);
+            }
+        }
+
+        /// <summary>
+        /// 다른 플레이어에게 먹이는 보조 사용 시작을 막습니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            nameof(Item.StartUseSecondary))]
+        private static class StartUseSecondaryPatch
+        {
+            [HarmonyPrefix]
+            private static bool Prefix(
+                Item __instance)
+            {
+                if (!IsBlockedItem(
+                        __instance))
+                {
+                    return true;
+                }
+
+                LogBlocked(
+                    __instance,
+                    "StartUseSecondary");
+
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 다른 플레이어에게 먹이는 보조 사용 진행을 막습니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            nameof(Item.ContinueUseSecondary))]
+        private static class ContinueUseSecondaryPatch
+        {
+            [HarmonyPrefix]
+            private static bool Prefix(
+                Item __instance)
+            {
+                return !IsBlockedItem(
+                    __instance);
+            }
+        }
+
+        /// <summary>
+        /// 보조 사용이 강제로 완료되는 경우도 차단합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            nameof(Item.FinishCastSecondary))]
+        private static class FinishCastSecondaryPatch
+        {
+            [HarmonyPrefix]
+            private static bool Prefix(
+                Item __instance)
+            {
+                if (!IsBlockedItem(
+                        __instance))
+                {
+                    return true;
+                }
+
+                LogBlocked(
+                    __instance,
+                    "FinishCastSecondary");
+
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 다른 코드가 직접 ConsumeDelayed를 실행해도
+        /// 실제 섭취 RPC가 호출되지 않도록 마지막 단계에서 막습니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            nameof(Item.ConsumeDelayed))]
+        private static class ConsumeDelayedPatch
+        {
+            [HarmonyPrefix]
+            private static bool Prefix(
+                Item __instance,
+                ref IEnumerator __result)
+            {
+                if (!IsBlockedItem(
+                        __instance))
+                {
+                    return true;
+                }
+
+                LogBlocked(
+                    __instance,
+                    "ConsumeDelayed");
+
+                __result =
+                    EmptyRoutine();
+
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// NestEgg 파손으로 생성된 아이템 인스턴스에만 부착되는 마커입니다.
+    /// </summary>
+    [DisallowMultipleComponent]
+    public sealed class NoEatMarker : MonoBehaviour
+    {
+    }
+}
