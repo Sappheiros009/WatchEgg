@@ -1,0 +1,476 @@
+using System;
+using BepInEx.Logging;
+using HarmonyLib;
+using UnityEngine;
+
+namespace Sapphire009.WatchEgg
+{
+    /// <summary>
+    /// PEAK의 Big Egg 실제 프리팹인 NestEgg에
+    /// 마우스 조준점을 올리면 주변 황금색 조명을 켭니다.
+    ///
+    /// Item.HoverEnter / HoverExit을 이용하므로
+    /// 별도의 마우스 Raycast를 생성하지 않습니다.
+    ///
+    /// Developer: Sapphire009
+    /// File: BrighteningEgg.cs
+    /// </summary>
+    [DisallowMultipleComponent]
+    public sealed class BrighteningEgg : MonoBehaviour
+    {
+        public const string DeveloperName =
+            "Sapphire009";
+
+        public const string TargetPrefabName =
+            "NestEgg";
+
+        private const string LogPrefix =
+            "[BrighteningEgg] ";
+
+        /// <summary>
+        /// 호버 중 목표 광원 세기입니다.
+        /// </summary>
+        private const float TargetLightIntensity =
+            4f;
+
+        /// <summary>
+        /// 달걀 주변에 퍼지는 광원 범위입니다.
+        /// </summary>
+        private const float LightRange =
+            2.5f;
+
+        /// <summary>
+        /// 발광이 켜지고 꺼지는 보간 속도입니다.
+        /// </summary>
+        private const float FadeSpeed =
+            12f;
+
+        /// <summary>
+        /// 이 값보다 어두우면 Light 오브젝트를 비활성화합니다.
+        /// </summary>
+        private const float DisableThreshold =
+            0.01f;
+
+        private static readonly Color GlowColor =
+            new Color(
+                1f,
+                0.68f,
+                0.16f,
+                1f);
+
+        private static readonly ManualLogSource Logger =
+            BepInEx.Logging.Logger.CreateLogSource(
+                "WatchEgg.BrighteningEgg");
+
+        private Item item;
+
+        private GameObject hoverLightObject;
+        private Light hoverLight;
+
+        private bool isHovered;
+        private float currentIntensity;
+
+        private void Awake()
+        {
+            item = GetComponent<Item>();
+
+            if (!IsNestEgg(item))
+            {
+                enabled = false;
+                return;
+            }
+
+            CreateHoverLight();
+
+            Logger.LogInfo(
+                LogPrefix +
+                "Attached to " +
+                item.gameObject.name);
+        }
+
+        private void Update()
+        {
+            if (item == null ||
+                hoverLight == null ||
+                hoverLightObject == null)
+            {
+                return;
+            }
+
+            /*
+             * 손에 든 상태에서는 호버 발광을 표시하지 않습니다.
+             */
+            if (item.itemState == ItemState.Held)
+            {
+                isHovered = false;
+            }
+
+            float targetIntensity =
+                isHovered
+                    ? TargetLightIntensity
+                    : 0f;
+
+            currentIntensity =
+                Mathf.MoveTowards(
+                    currentIntensity,
+                    targetIntensity,
+                    FadeSpeed * Time.deltaTime);
+
+            hoverLight.intensity =
+                currentIntensity;
+
+            if (currentIntensity > DisableThreshold)
+            {
+                if (!hoverLightObject.activeSelf)
+                {
+                    hoverLightObject.SetActive(true);
+                }
+
+                return;
+            }
+
+            if (!isHovered &&
+                hoverLightObject.activeSelf)
+            {
+                hoverLightObject.SetActive(false);
+            }
+        }
+
+        /// <summary>
+        /// Item.HoverEnter가 실행된 뒤 호출됩니다.
+        /// </summary>
+        public void BeginHover()
+        {
+            if (!enabled ||
+                item == null ||
+                item.itemState == ItemState.Held)
+            {
+                return;
+            }
+
+            if (isHovered)
+            {
+                return;
+            }
+
+            isHovered = true;
+
+            if (hoverLightObject != null &&
+                !hoverLightObject.activeSelf)
+            {
+                hoverLightObject.SetActive(true);
+            }
+
+            Logger.LogInfo(
+                LogPrefix +
+                "NestEgg hover entered.");
+        }
+
+        /// <summary>
+        /// Item.HoverExit가 실행된 뒤 호출됩니다.
+        /// </summary>
+        public void EndHover()
+        {
+            if (!isHovered)
+            {
+                return;
+            }
+
+            isHovered = false;
+
+            Logger.LogInfo(
+                LogPrefix +
+                "NestEgg hover exited.");
+        }
+
+        /// <summary>
+        /// NestEgg 중앙에 호버 전용 Point Light를 생성합니다.
+        /// </summary>
+        private void CreateHoverLight()
+        {
+            hoverLightObject =
+                new GameObject(
+                    "WatchEgg_NestEgg_HoverLight");
+
+            hoverLightObject.transform.SetParent(
+                transform,
+                false);
+
+            hoverLightObject.transform.localPosition =
+                CalculateLightLocalPosition();
+
+            hoverLightObject.transform.localRotation =
+                Quaternion.identity;
+
+            hoverLight =
+                hoverLightObject.AddComponent<Light>();
+
+            hoverLight.type =
+                LightType.Point;
+
+            hoverLight.color =
+                GlowColor;
+
+            hoverLight.intensity =
+                0f;
+
+            hoverLight.range =
+                LightRange;
+
+            hoverLight.shadows =
+                LightShadows.None;
+
+            hoverLight.renderMode =
+                LightRenderMode.Auto;
+
+            hoverLight.bounceIntensity =
+                0f;
+
+            hoverLightObject.SetActive(false);
+        }
+
+        /// <summary>
+        /// 달걀 Renderer들의 중심을 계산하여 조명을 배치합니다.
+        ///
+        /// Renderer를 찾지 못하면 NestEgg 피벗을 그대로 사용합니다.
+        /// </summary>
+        private Vector3 CalculateLightLocalPosition()
+        {
+            Renderer[] renderers =
+                GetComponentsInChildren<Renderer>(true);
+
+            if (renderers == null ||
+                renderers.Length == 0)
+            {
+                return Vector3.zero;
+            }
+
+            bool hasBounds = false;
+            Bounds combinedBounds =
+                new Bounds();
+
+            for (int i = 0;
+                 i < renderers.Length;
+                 i++)
+            {
+                Renderer currentRenderer =
+                    renderers[i];
+
+                if (currentRenderer == null ||
+                    !currentRenderer.enabled)
+                {
+                    continue;
+                }
+
+                Bounds rendererBounds =
+                    currentRenderer.bounds;
+
+                if (rendererBounds.size.sqrMagnitude <=
+                    0.0001f)
+                {
+                    continue;
+                }
+
+                if (!hasBounds)
+                {
+                    combinedBounds =
+                        rendererBounds;
+
+                    hasBounds =
+                        true;
+                }
+                else
+                {
+                    combinedBounds.Encapsulate(
+                        rendererBounds);
+                }
+            }
+
+            if (!hasBounds)
+            {
+                return Vector3.zero;
+            }
+
+            return transform.InverseTransformPoint(
+                combinedBounds.center);
+        }
+
+        private void OnDisable()
+        {
+            isHovered = false;
+            currentIntensity = 0f;
+
+            if (hoverLight != null)
+            {
+                hoverLight.intensity = 0f;
+            }
+
+            if (hoverLightObject != null)
+            {
+                hoverLightObject.SetActive(false);
+            }
+        }
+
+        private void OnDestroy()
+        {
+            if (hoverLightObject != null)
+            {
+                Destroy(hoverLightObject);
+                hoverLightObject = null;
+            }
+        }
+
+        /// <summary>
+        /// Item 인스턴스의 실제 프리팹 이름이 NestEgg인지 확인합니다.
+        /// </summary>
+        public static bool IsNestEgg(
+            Item targetItem)
+        {
+            if (targetItem == null)
+            {
+                return false;
+            }
+
+            return IsNestEggName(
+                targetItem.gameObject.name);
+        }
+
+        /// <summary>
+        /// Egg, Bird, BigEgg는 제외하고 NestEgg만 인정합니다.
+        /// </summary>
+        public static bool IsNestEggName(
+            string objectName)
+        {
+            return string.Equals(
+                NormalizePrefabName(objectName),
+                TargetPrefabName,
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Unity 네트워크 인스턴스에 붙는
+        /// (Clone) 접미사를 제거합니다.
+        /// </summary>
+        private static string NormalizePrefabName(
+            string objectName)
+        {
+            if (string.IsNullOrEmpty(objectName))
+            {
+                return string.Empty;
+            }
+
+            string normalized =
+                objectName.Trim();
+
+            const string cloneSuffix =
+                "(Clone)";
+
+            while (normalized.EndsWith(
+                       cloneSuffix,
+                       StringComparison.OrdinalIgnoreCase))
+            {
+                normalized =
+                    normalized.Substring(
+                        0,
+                        normalized.Length -
+                        cloneSuffix.Length)
+                    .Trim();
+            }
+
+            return normalized;
+        }
+
+        /// <summary>
+        /// 모든 NestEgg 인스턴스에 BrighteningEgg를 자동 부착합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            "Awake")]
+        private static class ItemAwakePatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(
+                Item __instance)
+            {
+                if (!IsNestEgg(__instance))
+                {
+                    return;
+                }
+
+                if (__instance
+                        .GetComponent<BrighteningEgg>() !=
+                    null)
+                {
+                    return;
+                }
+
+                __instance.gameObject
+                    .AddComponent<BrighteningEgg>();
+            }
+        }
+
+        /// <summary>
+        /// PEAK의 상호작용 조준점이 NestEgg를 가리키면
+        /// 발광을 시작합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            nameof(Item.HoverEnter))]
+        private static class ItemHoverEnterPatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(
+                Item __instance)
+            {
+                if (!IsNestEgg(__instance))
+                {
+                    return;
+                }
+
+                BrighteningEgg brighteningEgg =
+                    __instance
+                        .GetComponent<BrighteningEgg>();
+
+                if (brighteningEgg == null)
+                {
+                    brighteningEgg =
+                        __instance.gameObject
+                            .AddComponent<BrighteningEgg>();
+                }
+
+                brighteningEgg.BeginHover();
+            }
+        }
+
+        /// <summary>
+        /// 조준점이 NestEgg에서 벗어나면
+        /// 발광을 부드럽게 종료합니다.
+        /// </summary>
+        [HarmonyPatch(
+            typeof(Item),
+            nameof(Item.HoverExit))]
+        private static class ItemHoverExitPatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(
+                Item __instance)
+            {
+                if (!IsNestEgg(__instance))
+                {
+                    return;
+                }
+
+                BrighteningEgg brighteningEgg =
+                    __instance
+                        .GetComponent<BrighteningEgg>();
+
+                if (brighteningEgg == null)
+                {
+                    return;
+                }
+
+                brighteningEgg.EndHover();
+            }
+        }
+    }
+}
