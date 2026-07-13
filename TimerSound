@@ -60,7 +60,7 @@ namespace Sapphire009.WatchEgg
         /// </summary>
         private const float DoubleSpeedTickInterval =
             NormalTickInterval /
-            2f;
+            5f;
 
         /// <summary>
         /// 2초~0초 구간의 째깍 소리 간격입니다.
