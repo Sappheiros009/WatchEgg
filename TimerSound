@@ -66,11 +66,11 @@ namespace Sapphire009.WatchEgg
         /// 2초~0초 구간의 째깍 소리 간격입니다.
         ///
         /// 속도 4:
-        /// 0.25초마다 한 번 재생합니다.
+        /// 0.1초마다 한 번 재생합니다.
         /// </summary>
         private const float FinalSpeedTickInterval =
             NormalTickInterval /
-            4f;
+            10f;
 
         /// <summary>
         /// 평상시 소리 크기입니다.
