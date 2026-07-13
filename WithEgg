@@ -8,7 +8,7 @@ namespace Sapphire009.WatchEgg
 {
     /// <summary>
     /// 꺼진 모닥불을 켜기 위해서는 NestEgg가
-    /// 모닥불 반경 15 유닛 안에 있어야 합니다.
+    /// 모닥불 반경 20m 안에 있어야 합니다.
     ///
     /// 달걀은 플레이어가 손에 들고 있거나,
     /// 모닥불 근처 바닥에 놓여 있어도 인정됩니다.
@@ -32,12 +32,13 @@ namespace Sapphire009.WatchEgg
 
         /// <summary>
         /// 모닥불 점화가 허용되는 달걀의 최대 거리입니다.
-        ///
-        /// PEAK 원본의 플레이어 모닥불 집결 범위와 동일한
-        /// 15 유닛으로 설정했습니다.
         /// </summary>
         public const float RequiredEggRange =
-            15f;
+            20f;
+
+        private const float RequiredEggRangeSquared =
+            RequiredEggRange *
+            RequiredEggRange;
 
         private const string RequirementText =
             "BRING THE EGG TO THE CAMPFIRE";
@@ -52,8 +53,8 @@ namespace Sapphire009.WatchEgg
         /// <summary>
         /// 현재 씬에 존재하는 NestEgg 인스턴스 목록입니다.
         ///
-        /// 모닥불을 바라볼 때마다 모든 Item을 검색하지 않도록
-        /// Item.Awake 시점에 달걀만 등록합니다.
+        /// 모닥불을 사용할 때마다 모든 Item을 검색하지 않고,
+        /// Item.Awake 시점에 NestEgg만 등록합니다.
         /// </summary>
         private static readonly List<Item> ActiveNestEggs =
             new List<Item>();
@@ -64,17 +65,14 @@ namespace Sapphire009.WatchEgg
         private static void RegisterNestEgg(
             Item item)
         {
-            if (!IsNestEgg(
-                    item))
+            if (!IsNestEgg(item))
             {
                 return;
             }
 
-            if (!ActiveNestEggs.Contains(
-                    item))
+            if (!ActiveNestEggs.Contains(item))
             {
-                ActiveNestEggs.Add(
-                    item);
+                ActiveNestEggs.Add(item);
             }
 
             WithEggTracker tracker =
@@ -87,8 +85,7 @@ namespace Sapphire009.WatchEgg
                         .AddComponent<WithEggTracker>();
             }
 
-            tracker.Initialize(
-                item);
+            tracker.Initialize(item);
 
             Logger.LogInfo(
                 LogPrefix +
@@ -98,7 +95,7 @@ namespace Sapphire009.WatchEgg
         }
 
         /// <summary>
-        /// 파괴된 NestEgg를 목록에서 제거합니다.
+        /// 파괴되거나 제거된 NestEgg를 목록에서 제거합니다.
         /// </summary>
         internal static void UnregisterNestEgg(
             Item item)
@@ -113,19 +110,21 @@ namespace Sapphire009.WatchEgg
                 if (registeredItem == null ||
                     registeredItem == item)
                 {
-                    ActiveNestEggs.RemoveAt(
-                        i);
+                    ActiveNestEggs.RemoveAt(i);
                 }
             }
         }
 
         /// <summary>
-        /// 모닥불 주변에 NestEgg가 있는지 확인합니다.
+        /// 모닥불 중심의 반경 20m 범위 안에
+        /// NestEgg가 존재하는지 검사합니다.
         ///
-        /// 1. 플레이어가 손에 들고 있는 달걀
-        /// 2. 월드 바닥에 놓여 있는 활성 달걀
+        /// 수평거리만 계산하지 않고 X, Y, Z를 모두 사용하는
+        /// 3차원 구형 범위로 검사합니다.
         ///
-        /// 두 경우를 모두 검사합니다.
+        /// 인정되는 상태:
+        /// 1. 플레이어가 손에 들고 있는 NestEgg
+        /// 2. 바닥에 놓이거나 떨어져 있는 NestEgg
         /// </summary>
         private static bool IsNestEggInCampfireRange(
             Campfire campfire,
@@ -143,17 +142,17 @@ namespace Sapphire009.WatchEgg
                 campfire.transform.position;
 
             /*
-             * 플레이어가 현재 손에 들고 있는 NestEgg를 먼저 검사합니다.
+             * 플레이어가 현재 손에 들고 있는 NestEgg를 검사합니다.
              *
-             * 손에 든 아이템 오브젝트가 일시적으로 비활성화되는
-             * 경우에도 플레이어의 currentItem을 통해 감지합니다.
+             * 손에 든 아이템 오브젝트가 일시적으로 비활성화되어도
+             * Character.data.currentItem으로 확인할 수 있습니다.
              */
-            if (PlayerHandler.GetAllPlayerCharacters() !=
-                null)
+            IEnumerable<Character> characters =
+                PlayerHandler.GetAllPlayerCharacters();
+
+            if (characters != null)
             {
-                foreach (
-                    Character character
-                    in PlayerHandler.GetAllPlayerCharacters())
+                foreach (Character character in characters)
                 {
                     if (character == null ||
                         character.data == null)
@@ -164,16 +163,20 @@ namespace Sapphire009.WatchEgg
                     Item heldItem =
                         character.data.currentItem;
 
-                    if (!IsNestEgg(
-                            heldItem))
+                    if (!IsNestEgg(heldItem))
                     {
                         continue;
                     }
 
+                    Vector3 campfireToHeldEgg =
+                        character.Center -
+                        campfirePosition;
+
+                    float distanceSquared =
+                        campfireToHeldEgg.sqrMagnitude;
+
                     float heldEggDistance =
-                        Vector3.Distance(
-                            campfirePosition,
-                            character.Center);
+                        Mathf.Sqrt(distanceSquared);
 
                     if (heldEggDistance <
                         nearestDistance)
@@ -182,8 +185,8 @@ namespace Sapphire009.WatchEgg
                             heldEggDistance;
                     }
 
-                    if (heldEggDistance <=
-                        RequiredEggRange)
+                    if (distanceSquared <=
+                        RequiredEggRangeSquared)
                     {
                         return true;
                     }
@@ -191,7 +194,7 @@ namespace Sapphire009.WatchEgg
             }
 
             /*
-             * 바닥에 떨어져 있거나 던져진 NestEgg를 검사합니다.
+             * 바닥에 놓여 있거나 떨어져 있는 NestEgg를 검사합니다.
              */
             for (int i = ActiveNestEggs.Count - 1;
                  i >= 0;
@@ -206,23 +209,18 @@ namespace Sapphire009.WatchEgg
                 if (eggItem == null ||
                     eggItem.gameObject == null)
                 {
-                    ActiveNestEggs.RemoveAt(
-                        i);
-
+                    ActiveNestEggs.RemoveAt(i);
                     continue;
                 }
 
-                if (!IsNestEgg(
-                        eggItem))
+                if (!IsNestEgg(eggItem))
                 {
-                    ActiveNestEggs.RemoveAt(
-                        i);
-
+                    ActiveNestEggs.RemoveAt(i);
                     continue;
                 }
 
                 /*
-                 * 손에 든 달걀은 위에서 플레이어 위치 기준으로
+                 * 손에 들린 달걀은 위에서 플레이어 위치를 기준으로
                  * 이미 검사했습니다.
                  */
                 if (eggItem.itemState ==
@@ -231,16 +229,20 @@ namespace Sapphire009.WatchEgg
                     continue;
                 }
 
-                if (!eggItem.gameObject
-                        .activeInHierarchy)
+                if (!eggItem.gameObject.activeInHierarchy)
                 {
                     continue;
                 }
 
+                Vector3 campfireToWorldEgg =
+                    eggItem.transform.position -
+                    campfirePosition;
+
+                float distanceSquared =
+                    campfireToWorldEgg.sqrMagnitude;
+
                 float worldEggDistance =
-                    Vector3.Distance(
-                        campfirePosition,
-                        eggItem.transform.position);
+                    Mathf.Sqrt(distanceSquared);
 
                 if (worldEggDistance <
                     nearestDistance)
@@ -249,8 +251,8 @@ namespace Sapphire009.WatchEgg
                         worldEggDistance;
                 }
 
-                if (worldEggDistance <=
-                    RequiredEggRange)
+                if (distanceSquared <=
+                    RequiredEggRangeSquared)
                 {
                     return true;
                 }
@@ -281,8 +283,7 @@ namespace Sapphire009.WatchEgg
         private static string NormalizePrefabName(
             string objectName)
         {
-            if (string.IsNullOrWhiteSpace(
-                    objectName))
+            if (string.IsNullOrWhiteSpace(objectName))
             {
                 return string.Empty;
             }
@@ -294,15 +295,15 @@ namespace Sapphire009.WatchEgg
                 "(Clone)";
 
             while (normalized.EndsWith(
-                       cloneSuffix,
-                       StringComparison.OrdinalIgnoreCase))
+                cloneSuffix,
+                StringComparison.OrdinalIgnoreCase))
             {
                 normalized =
                     normalized.Substring(
-                        0,
-                        normalized.Length -
-                        cloneSuffix.Length)
-                    .Trim();
+                            0,
+                            normalized.Length -
+                            cloneSuffix.Length)
+                        .Trim();
             }
 
             return normalized;
@@ -320,13 +321,12 @@ namespace Sapphire009.WatchEgg
             private static void Postfix(
                 Item __instance)
             {
-                RegisterNestEgg(
-                    __instance);
+                RegisterNestEgg(__instance);
             }
         }
 
         /// <summary>
-        /// 모닥불을 바라봤을 때 달걀이 범위 밖에 있으면
+        /// 꺼진 모닥불을 바라봤을 때 달걀이 20m 밖에 있으면
         /// 기존 상호작용 문구 위에 달걀 요구 조건을 표시합니다.
         /// </summary>
         [HarmonyPatch(
@@ -348,14 +348,13 @@ namespace Sapphire009.WatchEgg
                 float nearestDistance;
 
                 if (IsNestEggInCampfireRange(
-                        __instance,
-                        out nearestDistance))
+                    __instance,
+                    out nearestDistance))
                 {
                     return;
                 }
 
-                if (string.IsNullOrEmpty(
-                        __result))
+                if (string.IsNullOrEmpty(__result))
                 {
                     __result =
                         RequirementText;
@@ -372,12 +371,12 @@ namespace Sapphire009.WatchEgg
 
         /// <summary>
         /// 모닥불 점화가 완료되는 최종 시점에서
-        /// NestEgg 거리 조건을 다시 검사합니다.
+        /// NestEgg의 20m 거리 조건을 검사합니다.
         ///
-        /// 상호작용을 시작한 뒤 누군가 달걀을 멀리 가져간 경우에도
-        /// 실제 Light_Rpc가 전송되지 않도록 차단합니다.
+        /// 상호작용을 시작한 뒤 누군가 달걀을 멀리 가져가도
+        /// 실제 모닥불 점화가 실행되지 않도록 차단합니다.
         ///
-        /// 이미 불이 켜져 있으면 원본 조리 기능을 그대로 허용합니다.
+        /// 이미 켜진 모닥불의 조리 기능에는 영향을 주지 않습니다.
         /// </summary>
         [HarmonyPatch(
             typeof(Campfire),
@@ -408,8 +407,8 @@ namespace Sapphire009.WatchEgg
                 }
 
                 /*
-                 * 이미 켜진 모닥불에서는 음식 조리 로직을
-                 * 방해하지 않습니다.
+                 * 이미 켜진 모닥불에서는 원본 조리 로직을
+                 * 그대로 실행합니다.
                  */
                 if (__instance.Lit)
                 {
@@ -419,14 +418,16 @@ namespace Sapphire009.WatchEgg
                 float nearestDistance;
 
                 if (IsNestEggInCampfireRange(
-                        __instance,
-                        out nearestDistance))
+                    __instance,
+                    out nearestDistance))
                 {
                     Logger.LogInfo(
                         LogPrefix +
                         "Campfire lighting allowed." +
                         " | EggDistance=" +
-                        nearestDistance +
+                        nearestDistance.ToString("F2") +
+                        " | RequiredRange=" +
+                        RequiredEggRange +
                         " | Campfire=" +
                         __instance.gameObject.name);
 
@@ -434,15 +435,13 @@ namespace Sapphire009.WatchEgg
                 }
 
                 string playerName =
-                    GetCharacterName(
-                        interactor);
+                    GetCharacterName(interactor);
 
                 string distanceText =
                     float.IsPositiveInfinity(
                         nearestDistance)
                         ? "No NestEgg found"
-                        : nearestDistance.ToString(
-                            "F2");
+                        : nearestDistance.ToString("F2");
 
                 Logger.LogWarning(
                     LogPrefix +
@@ -465,7 +464,7 @@ namespace Sapphire009.WatchEgg
 
                 /*
                  * 원본 Interact_CastFinished 실행을 막아
-                 * Light_Rpc가 전송되지 않도록 합니다.
+                 * 모닥불 점화 RPC가 실행되지 않게 합니다.
                  */
                 return false;
             }
@@ -496,7 +495,7 @@ namespace Sapphire009.WatchEgg
 
     /// <summary>
     /// NestEgg가 파괴되거나 씬에서 제거될 때
-    /// WithEgg의 활성 달걀 목록에서 제거하기 위한 추적 컴포넌트입니다.
+    /// 활성 달걀 목록에서 제거하기 위한 추적 컴포넌트입니다.
     /// </summary>
     [DisallowMultipleComponent]
     public sealed class WithEggTracker : MonoBehaviour
