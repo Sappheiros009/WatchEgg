@@ -3,31 +3,28 @@ using BepInEx.Logging;
 using HarmonyLib;
 using Peak.Afflictions;
 using System;
-using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
 [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
 public sealed class StaminaFull : BaseUnityPlugin
 {
-    public const string PluginGUID = "Sapphire009.StaminaFull";
-    public const string PluginName = "StaminaFull";
-    public const string PluginVersion = "1.0.0";
+    public const string PluginGUID =
+        "Sapphire009.StaminaFull";
+
+    public const string PluginName =
+        "StaminaFull";
+
+    public const string PluginVersion =
+        "1.0.1";
 
     private const string BuildMarker =
-        "InfiniteStamina-AllStatusBlock-R2";
+        "StatusProtection-NormalStamina-R3";
 
-    private const int MaximumLogCount = 50;
+    private const int MaximumLogCount =
+        50;
 
     internal static ManualLogSource ModLogger;
-
-    /*
-     * 보너스 스태미나가 직접 수정되는 경우에도
-     * 이전보다 감소하지 않도록 캐릭터별 최고값을 저장합니다.
-     */
-    private static readonly Dictionary<int, float>
-        PreservedExtraStamina =
-            new Dictionary<int, float>();
 
     private static int blockedStatusLogCount;
     private static int blockedAfflictionLogCount;
@@ -37,33 +34,42 @@ public sealed class StaminaFull : BaseUnityPlugin
 
     private void Awake()
     {
-        ModLogger = Logger;
+        ModLogger =
+            Logger;
 
-        harmony = new Harmony(PluginGUID);
+        harmony =
+            new Harmony(PluginGUID);
+
         harmony.PatchAll();
 
         Logger.LogInfo(
             $"{PluginName} {PluginVersion} loaded. " +
             $"Build: {BuildMarker}. " +
-            "Infinite stamina and complete status protection " +
-            "are enabled outside Airport.");
+            "Complete status protection is enabled outside Airport. " +
+            "Original stamina consumption remains enabled.");
     }
 
     private void OnDestroy()
     {
-        PreservedExtraStamina.Clear();
+        blockedStatusLogCount =
+            0;
 
-        blockedStatusLogCount = 0;
-        blockedAfflictionLogCount = 0;
-        blockedThornLogCount = 0;
+        blockedAfflictionLogCount =
+            0;
+
+        blockedThornLogCount =
+            0;
 
         if (harmony != null)
         {
             harmony.UnpatchSelf();
-            harmony = null;
+
+            harmony =
+                null;
         }
 
-        ModLogger = null;
+        ModLogger =
+            null;
     }
 
     internal static bool IsAirportScene()
@@ -71,14 +77,16 @@ public sealed class StaminaFull : BaseUnityPlugin
         string sceneName =
             SceneManager.GetActiveScene().name;
 
-        if (string.IsNullOrEmpty(sceneName))
+        if (string.IsNullOrEmpty(
+                sceneName))
         {
             return false;
         }
 
         return sceneName.IndexOf(
                    "Airport",
-                   StringComparison.OrdinalIgnoreCase) >= 0;
+                   StringComparison.OrdinalIgnoreCase) >=
+               0;
     }
 
     internal static bool CanApplyProtection(
@@ -114,113 +122,16 @@ public sealed class StaminaFull : BaseUnityPlugin
     }
 
     /*
-     * 일반 스태미나를 현재 최대치로 복구하고,
-     * 보너스 스태미나는 이전 값보다 감소하지 않게 합니다.
-     */
-    internal static void FillAndPreserveStamina(
-        Character character)
-    {
-        if (!CanApplyProtection(character))
-        {
-            if (character != null)
-            {
-                PreservedExtraStamina.Remove(
-                    character.GetInstanceID());
-            }
-
-            return;
-        }
-
-        float maximumStamina =
-            character.GetMaxStamina();
-
-        /*
-         * 모든 상태를 0으로 유지하므로 일반 최대치는
-         * 정상적으로 1이 됩니다.
-         */
-        maximumStamina =
-            Mathf.Max(
-                maximumStamina,
-                1f);
-
-        bool staminaChanged =
-            false;
-
-        if (Mathf.Abs(
-                character.data.currentStamina -
-                maximumStamina) >
-            0.0001f)
-        {
-            character.data.currentStamina =
-                maximumStamina;
-
-            staminaChanged =
-                true;
-        }
-
-        int characterId =
-            character.GetInstanceID();
-
-        float preservedExtra;
-
-        if (!PreservedExtraStamina.TryGetValue(
-                characterId,
-                out preservedExtra))
-        {
-            preservedExtra =
-                character.data.extraStamina;
-
-            PreservedExtraStamina.Add(
-                characterId,
-                preservedExtra);
-        }
-        else
-        {
-            /*
-             * 아이템 등으로 보너스 스태미나가 증가하면
-             * 새로운 최고값으로 저장합니다.
-             */
-            if (character.data.extraStamina >
-                preservedExtra)
-            {
-                preservedExtra =
-                    character.data.extraStamina;
-
-                PreservedExtraStamina[
-                    characterId] =
-                        preservedExtra;
-            }
-            /*
-             * 보너스 스태미나가 감소했다면
-             * 저장된 값으로 되돌립니다.
-             */
-            else if (character.data.extraStamina <
-                     preservedExtra)
-            {
-                character.data.extraStamina =
-                    preservedExtra;
-
-                staminaChanged =
-                    true;
-            }
-        }
-
-        if (staminaChanged &&
-            GUIManager.instance != null &&
-            GUIManager.instance.bar != null)
-        {
-            GUIManager.instance.bar.ChangeBar();
-        }
-    }
-
-    /*
-     * 이미 적용돼 있던 부상, 허기, 독 등의 상태와
-     * 지속형 Affliction 및 가시를 제거합니다.
+     * 이미 적용돼 있던 부상, 허기, 추위, 독 등의 상태와
+     * 지속형 Affliction 및 몸에 박힌 가시를 제거합니다.
+     *
+     * 스태미나 값은 수정하지 않습니다.
      */
     internal static void ClearAllNegativeStates(
         Character character)
     {
-        if (!CanApplyProtection(character))
+        if (!CanApplyProtection(
+                character))
         {
             return;
         }
@@ -242,14 +153,14 @@ public sealed class StaminaFull : BaseUnityPlugin
                 (CharacterAfflictions.STATUSTYPE)i;
 
             if (afflictions.GetCurrentStatus(
-                    statusType) <= 0f)
+                    statusType) <=
+                0f)
             {
                 continue;
             }
 
             /*
-             * SetStatus의 0 감소는 허용되므로
-             * 현재 적용된 모든 상태를 제거합니다.
+             * 현재 적용돼 있는 상태 수치를 0으로 제거합니다.
              */
             afflictions.SetStatus(
                 statusType,
@@ -261,8 +172,8 @@ public sealed class StaminaFull : BaseUnityPlugin
         }
 
         /*
-         * Web 상태값이 이미 0이어도 내부 플래그가 남아 있으면
-         * 거미줄 판정이 계속될 수 있으므로 함께 해제합니다.
+         * Web 상태 수치가 0이어도 내부 플래그가 남는 경우를
+         * 방지하기 위해 함께 해제합니다.
          */
         if (afflictions.isWebbed)
         {
@@ -285,22 +196,24 @@ public sealed class StaminaFull : BaseUnityPlugin
         }
 
         /*
-         * 독 지속 피해, 좀비 감염, 졸음, 저주,
-         * 스태미나 변화 등의 지속형 Affliction도 제거합니다.
+         * 독 지속 피해, 좀비 감염, 졸음, 저주 등의
+         * 지속형 Affliction을 제거합니다.
          */
         if (afflictions.afflictionList != null &&
-            afflictions.afflictionList.Count > 0)
+            afflictions.afflictionList.Count >
+            0)
         {
             afflictions.ClearAllAfflictions();
         }
 
         /*
-         * 이미 몸에 박힌 가시도 제거합니다.
+         * 이미 몸에 박혀 있는 가시도 제거합니다.
          */
         if (afflictions.physicalThorns != null)
         {
             for (int i =
-                     afflictions.physicalThorns.Count - 1;
+                     afflictions.physicalThorns.Count -
+                     1;
                  i >= 0;
                  i--)
             {
@@ -320,160 +233,9 @@ public sealed class StaminaFull : BaseUnityPlugin
     }
 
     /*
-     * 등반, 달리기, 물건 들기 등에서 호출되는
-     * PEAK 원본 스태미나 소비를 성공 처리하면서
-     * 실제 수치는 차감하지 않습니다.
-     */
-    [HarmonyPatch(
-        typeof(Character),
-        "UseStamina",
-        new Type[]
-        {
-            typeof(float),
-            typeof(bool)
-        })]
-    private static class CharacterUseStaminaPatch
-    {
-        [HarmonyPrefix]
-        private static bool Prefix(
-            Character __instance,
-            float __0,
-            bool __1,
-            ref bool __result)
-        {
-            float usage =
-                __0;
-
-            if (usage <= 0f)
-            {
-                return true;
-            }
-
-            if (!CanApplyProtection(
-                    __instance))
-            {
-                return true;
-            }
-
-            FillAndPreserveStamina(
-                __instance);
-
-            /*
-             * 스태미나를 사용했다는 시간 기록은 유지하지만
-             * currentStamina와 extraStamina는 감소시키지 않습니다.
-             */
-            __instance.data.sinceUseStamina =
-                0f;
-
-            __result =
-                true;
-
-            return false;
-        }
-    }
-
-    /*
-     * AddStamina에 음수가 들어와 직접 스태미나를
-     * 감소시키는 경로도 차단합니다.
-     */
-    [HarmonyPatch(
-        typeof(Character),
-        nameof(Character.AddStamina),
-        new Type[]
-        {
-            typeof(float)
-        })]
-    private static class CharacterAddStaminaPatch
-    {
-        [HarmonyPrefix]
-        private static bool Prefix(
-            Character __instance,
-            float __0)
-        {
-            float amount =
-                __0;
-
-            if (amount >= 0f)
-            {
-                return true;
-            }
-
-            return !CanApplyProtection(
-                __instance);
-        }
-    }
-
-    /*
-     * 보너스 스태미나를 낮은 값으로 직접 설정하는 경로를
-     * 즉시 차단합니다.
-     */
-    [HarmonyPatch(
-        typeof(Character),
-        nameof(Character.SetExtraStamina),
-        new Type[]
-        {
-            typeof(float)
-        })]
-    private static class CharacterSetExtraStaminaPatch
-    {
-        [HarmonyPrefix]
-        private static bool Prefix(
-            Character __instance,
-            float __0)
-        {
-            float requestedAmount =
-                __0;
-
-            if (!CanApplyProtection(
-                    __instance))
-            {
-                return true;
-            }
-
-            if (requestedAmount >=
-                __instance.data.extraStamina)
-            {
-                return true;
-            }
-
-            return false;
-        }
-    }
-
-    /*
-     * AddExtraStamina에 음수가 들어오는 경우도 차단합니다.
-     */
-    [HarmonyPatch(
-        typeof(Character),
-        nameof(Character.AddExtraStamina),
-        new Type[]
-        {
-            typeof(float)
-        })]
-    private static class CharacterAddExtraStaminaPatch
-    {
-        [HarmonyPrefix]
-        private static bool Prefix(
-            Character __instance,
-            float __0)
-        {
-            float amount =
-                __0;
-
-            if (amount >= 0f)
-            {
-                return true;
-            }
-
-            return !CanApplyProtection(
-                __instance);
-        }
-    }
-
-    /*
      * Injury, Hunger, Cold, Poison, Crab, Curse,
      * Drowsy, Weight, Hot, Thorns, Spores, Web 등
-     * 모든 양수 상태 추가를 차단합니다.
+     * 양수 상태가 새로 추가되는 것을 차단합니다.
      */
     [HarmonyPatch(
         typeof(CharacterAfflictions),
@@ -505,7 +267,8 @@ public sealed class StaminaFull : BaseUnityPlugin
                 __1;
 
             if (amount <= 0f ||
-                !CanApplyProtection(__instance))
+                !CanApplyProtection(
+                    __instance))
             {
                 return true;
             }
@@ -550,7 +313,8 @@ public sealed class StaminaFull : BaseUnityPlugin
                 __1;
 
             if (amount <= 0f ||
-                !CanApplyProtection(__instance))
+                !CanApplyProtection(
+                    __instance))
             {
                 return true;
             }
@@ -565,10 +329,10 @@ public sealed class StaminaFull : BaseUnityPlugin
     }
 
     /*
-     * SetStatus가 현재보다 높은 수치로 상태를 직접 지정하는
-     * 경로도 차단합니다.
+     * SetStatus가 현재보다 높은 값으로 상태를 직접 설정하는
+     * 경우를 차단합니다.
      *
-     * 상태를 0으로 낮추는 동작은 허용합니다.
+     * 현재보다 낮게 만들거나 0으로 제거하는 처리는 허용합니다.
      */
     [HarmonyPatch(
         typeof(CharacterAfflictions),
@@ -604,9 +368,6 @@ public sealed class StaminaFull : BaseUnityPlugin
                 __instance.GetCurrentStatus(
                     statusType);
 
-            /*
-             * 현재보다 낮은 수치나 0으로 치료하는 동작은 허용합니다.
-             */
             if (requestedAmount <=
                 currentAmount)
             {
@@ -615,7 +376,8 @@ public sealed class StaminaFull : BaseUnityPlugin
 
             LogBlockedStatus(
                 statusType,
-                requestedAmount - currentAmount,
+                requestedAmount -
+                currentAmount,
                 "SetStatus");
 
             return false;
@@ -624,10 +386,7 @@ public sealed class StaminaFull : BaseUnityPlugin
 
     /*
      * PoisonOverTime, ZombieBite, Drowsy 등
-     * 지속형 Affliction 자체의 추가를 차단합니다.
-     *
-     * 모든 Affliction을 막으므로 유익한 시간제 버프도
-     * 이 모드가 활성화된 동안에는 추가되지 않습니다.
+     * 지속형 Affliction 추가를 차단합니다.
      */
     [HarmonyPatch(
         typeof(CharacterAfflictions),
@@ -704,7 +463,7 @@ public sealed class StaminaFull : BaseUnityPlugin
     }
 
     /*
-     * 인덱스 기반 가시 추가도 차단합니다.
+     * 인덱스 기반 가시 추가를 차단합니다.
      */
     [HarmonyPatch(
         typeof(CharacterAfflictions),
@@ -733,8 +492,7 @@ public sealed class StaminaFull : BaseUnityPlugin
     }
 
     /*
-     * RPC를 통해 가시 오브젝트가 직접 활성화되는 경우도
-     * 로컬 캐릭터에서는 차단합니다.
+     * RPC를 통해 가시가 직접 활성화되는 경우도 차단합니다.
      */
     [HarmonyPatch(
         typeof(CharacterAfflictions),
@@ -763,8 +521,10 @@ public sealed class StaminaFull : BaseUnityPlugin
     }
 
     /*
-     * 다른 코드나 네트워크 동기화가 값을 직접 변경했더라도
-     * 다음 물리 프레임에 다시 완전한 상태로 복구합니다.
+     * 다른 코드나 네트워크 동기화로 이미 상태가 적용됐더라도
+     * 다음 물리 프레임에 제거합니다.
+     *
+     * 기존 버전과 달리 여기서 스태미나를 복구하지 않습니다.
      */
     [HarmonyPatch(
         typeof(Character),
@@ -778,19 +538,10 @@ public sealed class StaminaFull : BaseUnityPlugin
             if (!CanApplyProtection(
                     __instance))
             {
-                if (__instance != null)
-                {
-                    PreservedExtraStamina.Remove(
-                        __instance.GetInstanceID());
-                }
-
                 return;
             }
 
             ClearAllNegativeStates(
-                __instance);
-
-            FillAndPreserveStamina(
                 __instance);
         }
     }
@@ -810,11 +561,13 @@ public sealed class StaminaFull : BaseUnityPlugin
 
         ModLogger?.LogInfo(
             $"[StaminaFull] Status blocked " +
-            $"({blockedStatusLogCount}/{MaximumLogCount}). " +
+            $"({blockedStatusLogCount}/" +
+            $"{MaximumLogCount}). " +
             $"Status={statusType}, " +
             $"Amount={amount:0.0000}, " +
             $"Source={source}, " +
-            $"Scene={SceneManager.GetActiveScene().name}");
+            $"Scene=" +
+            $"{SceneManager.GetActiveScene().name}");
     }
 
     private static void LogBlockedThorn()
@@ -829,7 +582,9 @@ public sealed class StaminaFull : BaseUnityPlugin
 
         ModLogger?.LogInfo(
             $"[StaminaFull] Thorn blocked " +
-            $"({blockedThornLogCount}/{MaximumLogCount}). " +
-            $"Scene={SceneManager.GetActiveScene().name}");
+            $"({blockedThornLogCount}/" +
+            $"{MaximumLogCount}). " +
+            $"Scene=" +
+            $"{SceneManager.GetActiveScene().name}");
     }
 }
