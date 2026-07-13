@@ -8,22 +8,16 @@ using UnityEngine.SceneManagement;
 namespace Sapphire009.WatchEgg
 {
     /// <summary>
-    /// PEAK의 Big Egg 실제 프리팹인 NestEgg 전용 체크포인트입니다.
+    /// NestEgg 전용 3차원 구형 체크포인트입니다.
     ///
-    /// NestEgg를 들고 실제로 이동한 3D 경로를 누적하여
-    /// 약 25m마다 새로운 체크포인트를 저장합니다.
+    /// 마지막 체크포인트를 중심으로 반지름 25m의 구형 범위를 계산합니다.
+    /// 실제 달걀 위치가 범위 밖으로 나가고 안전한 바닥 위치를 찾으면
+    /// 해당 위치를 새로운 체크포인트로 저장합니다.
     ///
-    /// 수평 이동뿐만 아니라 수직 등반, 경사로 이동,
-    /// 굽은 경로도 실제 이동거리로 계산됩니다.
+    /// X, Y, Z를 모두 계산하므로 수평, 수직, 대각선 이동이
+    /// 모두 동일하게 적용됩니다.
     ///
-    /// 저장 위치는 NestEgg의 X/Z 위치를 우선 사용하고,
-    /// 달걀의 콜라이더 최하단이 바닥 표면에 닿도록 Y값을 보정합니다.
-    ///
-    /// 이 클래스는 달걀이 깨졌을 때 자동 재생성하지 않습니다.
     /// 달걀 생성은 YSpawn.cs에서 처리합니다.
-    ///
-    /// Developer: Sapphire009
-    /// File: EggCheckpoint.cs
     /// </summary>
     [DisallowMultipleComponent]
     public sealed class EggCheckpoint : MonoBehaviour
@@ -35,51 +29,16 @@ namespace Sapphire009.WatchEgg
             "NestEgg";
 
         /// <summary>
-        /// 체크포인트 목표 누적 이동거리입니다.
+        /// 마지막 체크포인트를 중심으로 하는
+        /// 3차원 구형 범위의 반지름입니다.
         /// </summary>
         public const float TargetCheckpointDistance =
             25f;
 
-        /// <summary>
-        /// 25m 기준 허용 오차입니다.
-        /// 누적 이동거리 23m부터 안전 위치 탐색을 시작합니다.
-        /// </summary>
-        public const float DistanceTolerance =
-            2f;
+        private const float TargetCheckpointDistanceSquared =
+            TargetCheckpointDistance *
+            TargetCheckpointDistance;
 
-        public const float MinimumCheckpointDistance =
-            TargetCheckpointDistance -
-            DistanceTolerance;
-
-        public const float MaximumCheckpointDistance =
-            TargetCheckpointDistance +
-            DistanceTolerance;
-
-        /// <summary>
-        /// 한 프레임에 이 거리보다 많이 이동한 경우
-        /// 텔레포트, 리스폰, 네트워크 위치 튐으로 간주하고
-        /// 누적 이동거리에서 제외합니다.
-        /// </summary>
-        private const float MaximumAcceptedFrameTravelDistance =
-            3f;
-
-        /// <summary>
-        /// 체크포인트 저장 전 플레이어가 안정적으로
-        /// 서 있어야 하는 시간입니다.
-        /// </summary>
-        private const float RequiredStableTime =
-            0.55f;
-
-        /// <summary>
-        /// 플레이어 발밑 위치 이동 속도가 이 값 이하면
-        /// 정지 상태로 판정합니다.
-        /// </summary>
-        private const float MaximumStableGroundSpeed =
-            0.45f;
-
-        /// <summary>
-        /// 바닥으로 인정할 최소 경사 법선값입니다.
-        /// </summary>
         private const float MinimumGroundNormalY =
             0.55f;
 
@@ -87,7 +46,7 @@ namespace Sapphire009.WatchEgg
             2.5f;
 
         private const float GroundCastDistance =
-            5f;
+            6f;
 
         private const float InitialGroundCastDistance =
             12f;
@@ -95,18 +54,10 @@ namespace Sapphire009.WatchEgg
         private const float GroundCastRadius =
             0.18f;
 
-        /// <summary>
-        /// 콜라이더가 바닥 안으로 파묻히지 않도록 하는
-        /// 최소 표면 여유값입니다.
-        /// </summary>
         private const float GroundSurfacePadding =
             0.015f;
 
-        /// <summary>
-        /// 손에 든 달걀의 X/Z 아래에서 찾은 바닥이
-        /// 플레이어 발밑으로부터 너무 멀면 사용하지 않습니다.
-        /// </summary>
-        private const float MaximumEggGroundDistanceFromPlayer =
+        private const float MaximumEggGroundDistanceFromHolder =
             1.6f;
 
         private const string LogPrefix =
@@ -116,68 +67,42 @@ namespace Sapphire009.WatchEgg
             BepInEx.Logging.Logger.CreateLogSource(
                 "WatchEgg.EggCheckpoint");
 
-        /// <summary>
-        /// 같은 달걀의 Break 호출이 중복 처리되는 것을 막습니다.
-        /// </summary>
         private static readonly HashSet<int> CountedBrokenViewIds =
             new HashSet<int>();
 
         private static int activeSceneHandle =
             int.MinValue;
 
-        /// <summary>
-        /// 현재 씬에 저장된 체크포인트가 있는지 나타냅니다.
-        /// </summary>
         public static bool HasCheckpoint
         {
             get;
             private set;
         }
 
-        /// <summary>
-        /// NestEgg Transform 피벗을 배치할 위치입니다.
-        /// 콜라이더 최하단이 바닥에 붙도록 보정되어 있습니다.
-        /// </summary>
         public static Vector3 CheckpointPosition
         {
             get;
             private set;
         }
 
-        /// <summary>
-        /// 체크포인트에서 새 NestEgg를 생성할 때 사용할 회전입니다.
-        /// </summary>
         public static Quaternion CheckpointRotation
         {
             get;
             private set;
         }
 
-        /// <summary>
-        /// 현재 씬의 체크포인트 저장 횟수입니다.
-        /// </summary>
         public static int CheckpointNumber
         {
             get;
             private set;
         }
 
-        /// <summary>
-        /// 현재 씬에서 NestEgg가 깨진 횟수입니다.
-        /// CountUI.cs에서 이 값을 표시합니다.
-        /// </summary>
         public static int BrokenEggCount
         {
             get;
             private set;
         }
 
-        /// <summary>
-        /// 마지막 체크포인트 이후 실제로 이동한
-        /// 누적 3D 경로 거리입니다.
-        ///
-        /// 수평 거리와 수직 거리를 모두 포함합니다.
-        /// </summary>
         public static float DistanceFromLastCheckpoint
         {
             get;
@@ -186,37 +111,10 @@ namespace Sapphire009.WatchEgg
 
         private Item item;
 
-        /// <summary>
-        /// NestEgg가 처음 생성됐을 때의 안정적인 회전값입니다.
-        /// 손에 들었을 때의 흔들린 회전값은 저장하지 않습니다.
-        /// </summary>
         private Quaternion eggRestRotation;
 
-        /// <summary>
-        /// NestEgg Transform 피벗에서 콜라이더 최하단까지의 거리입니다.
-        /// </summary>
         private float pivotToEggBottom =
             0.2f;
-
-        /// <summary>
-        /// 실제 이동거리 누적을 위한 이전 플레이어 위치입니다.
-        ///
-        /// NestEgg 자체의 손 흔들림을 이동거리로 계산하지 않도록
-        /// 달걀 Transform이 아닌 플레이어 Transform을 사용합니다.
-        /// </summary>
-        private Vector3 previousTrackedPosition;
-
-        private bool hasPreviousTrackedPosition;
-
-        private bool waitingForStableCheckpoint;
-
-        private bool wasHeldByLocalPlayer;
-
-        private Vector3 previousGroundPosition;
-
-        private bool hasPreviousGroundPosition;
-
-        private float stableGroundTimer;
 
         private void Awake()
         {
@@ -243,9 +141,9 @@ namespace Sapphire009.WatchEgg
                 LogPrefix +
                 "Attached to " +
                 item.gameObject.name +
-                " | BottomOffset=" +
-                pivotToEggBottom +
-                " | DistanceMode=Accumulated3D");
+                " | Radius=" +
+                TargetCheckpointDistance +
+                " | DistanceMode=EggToCheckpoint3DSphere");
         }
 
         private void Update()
@@ -257,454 +155,115 @@ namespace Sapphire009.WatchEgg
                 return;
             }
 
-            Character localCharacter;
-
-            if (!IsHeldByLocalPlayer(
-                    out localCharacter))
-            {
-                HandleNotHeld();
-                return;
-            }
-
-            HandleHeld(
-                localCharacter);
-
-            /*
-             * 로컬 플레이어가 NestEgg를 들고 실제로 이동한
-             * 3D 경로를 매 프레임 누적합니다.
-             */
-            UpdateAccumulatedTravelDistance(
-                localCharacter);
-
-            bool isStable =
-                UpdateStableGroundState(
-                    localCharacter);
-
-            /*
-             * 최초 체크포인트가 아직 없는 경우에는
-             * 안전한 바닥에서 멈췄을 때 시작 위치를 저장합니다.
-             */
             if (!HasCheckpoint)
             {
-                DistanceFromLastCheckpoint =
-                    0f;
+                CacheInitialCheckpoint();
 
-                if (isStable)
+                if (!HasCheckpoint)
                 {
-                    SaveCheckpoint(
-                        localCharacter,
-                        true);
-                }
+                    DistanceFromLastCheckpoint =
+                        0f;
 
+                    return;
+                }
+            }
+
+            Vector3 checkpointToEgg =
+                transform.position -
+                CheckpointPosition;
+
+            float distanceSquared =
+                checkpointToEgg.sqrMagnitude;
+
+            DistanceFromLastCheckpoint =
+                Mathf.Sqrt(distanceSquared);
+
+            /*
+             * 마지막 체크포인트 중심의 반지름 25m
+             * 3차원 구형 범위 안이면 기존 체크포인트를 유지합니다.
+             */
+            if (distanceSquared <
+                TargetCheckpointDistanceSquared)
+            {
                 return;
             }
 
-            /*
-             * 실제 누적 이동거리가 23m 이상이면
-             * 다음 안전한 지점에서 체크포인트 저장을 기다립니다.
-             */
-            if (DistanceFromLastCheckpoint >=
-                MinimumCheckpointDistance)
+            Vector3 safeCheckpointPosition;
+
+            if (!TryGetSafeCheckpointPosition(
+                    out safeCheckpointPosition))
             {
-                waitingForStableCheckpoint =
-                    true;
+                return;
             }
 
-            if (!waitingForStableCheckpoint ||
-                !isStable)
+            Vector3 checkpointToSafePosition =
+                safeCheckpointPosition -
+                CheckpointPosition;
+
+            /*
+             * 실제 저장될 안전한 스폰 위치도
+             * 기존 체크포인트에서 25m 이상 떨어져 있어야 합니다.
+             */
+            if (checkpointToSafePosition.sqrMagnitude <
+                TargetCheckpointDistanceSquared)
             {
                 return;
             }
 
             SaveCheckpoint(
-                localCharacter,
-                false);
+                safeCheckpointPosition);
         }
 
-        /// <summary>
-        /// 현재 로컬 플레이어가 이 NestEgg 인스턴스를
-        /// 직접 들고 있는지 확인합니다.
-        /// </summary>
-        private bool IsHeldByLocalPlayer(
-            out Character localCharacter)
-        {
-            localCharacter =
-                Character.localCharacter;
-
-            if (localCharacter == null ||
-                localCharacter.data == null ||
-                !localCharacter.IsLocal ||
-                item == null)
-            {
-                return false;
-            }
-
-            return
-                localCharacter.data.currentItem ==
-                item &&
-                item.itemState ==
-                ItemState.Held;
-        }
-
-        /// <summary>
-        /// NestEgg를 새로 들었을 때
-        /// 현재 플레이어 위치부터 이동거리 추적을 시작합니다.
-        ///
-        /// 이전까지 누적된 거리는 유지되므로
-        /// 달걀을 잠시 내려놓거나 다시 집어도 진행도가 사라지지 않습니다.
-        /// </summary>
-        private void HandleHeld(
-            Character localCharacter)
-        {
-            if (wasHeldByLocalPlayer)
-            {
-                return;
-            }
-
-            wasHeldByLocalPlayer =
-                true;
-
-            stableGroundTimer =
-                0f;
-
-            hasPreviousGroundPosition =
-                false;
-
-            hasPreviousTrackedPosition =
-                false;
-
-            if (localCharacter != null)
-            {
-                previousTrackedPosition =
-                    localCharacter.transform.position;
-
-                hasPreviousTrackedPosition =
-                    true;
-            }
-
-            Logger.LogInfo(
-                LogPrefix +
-                "NestEgg tracking started." +
-                " | AccumulatedDistance=" +
-                DistanceFromLastCheckpoint);
-        }
-
-        /// <summary>
-        /// 달걀을 놓거나 다른 플레이어에게 넘기면
-        /// 위치 추적 기준만 초기화합니다.
-        ///
-        /// 기존 누적 이동거리는 유지합니다.
-        /// </summary>
-        private void HandleNotHeld()
-        {
-            if (!wasHeldByLocalPlayer)
-            {
-                return;
-            }
-
-            wasHeldByLocalPlayer =
-                false;
-
-            stableGroundTimer =
-                0f;
-
-            hasPreviousGroundPosition =
-                false;
-
-            hasPreviousTrackedPosition =
-                false;
-
-            Logger.LogInfo(
-                LogPrefix +
-                "NestEgg tracking paused." +
-                " | AccumulatedDistance=" +
-                DistanceFromLastCheckpoint);
-        }
-
-        /// <summary>
-        /// 플레이어가 NestEgg를 들고 이동한
-        /// 실제 3D 경로 거리를 누적합니다.
-        ///
-        /// 기존처럼 시작점과 현재 위치 사이의 직선거리를
-        /// 계산하지 않고, 각 프레임의 이동 거리를 더합니다.
-        ///
-        /// 따라서 수직 등반, 굽은 길, 경사로 이동도
-        /// 정상적으로 체크포인트 거리에 포함됩니다.
-        /// </summary>
-        private void UpdateAccumulatedTravelDistance(
-            Character localCharacter)
-        {
-            if (localCharacter == null)
-            {
-                hasPreviousTrackedPosition =
-                    false;
-
-                return;
-            }
-
-            Vector3 currentPosition =
-                localCharacter.transform.position;
-
-            if (!hasPreviousTrackedPosition)
-            {
-                previousTrackedPosition =
-                    currentPosition;
-
-                hasPreviousTrackedPosition =
-                    true;
-
-                return;
-            }
-
-            float frameTravelDistance =
-                Vector3.Distance(
-                    previousTrackedPosition,
-                    currentPosition);
-
-            /*
-             * 다음 프레임을 위해 현재 위치는 항상 저장합니다.
-             *
-             * 비정상 이동이 발생해도 이후 정상 이동이
-             * 계속 제외되는 것을 방지합니다.
-             */
-            previousTrackedPosition =
-                currentPosition;
-
-            if (float.IsNaN(
-                    frameTravelDistance) ||
-                float.IsInfinity(
-                    frameTravelDistance))
-            {
-                return;
-            }
-
-            /*
-             * 순간이동, 리스폰, 위치 동기화 오류로
-             * 한 프레임에 과도하게 이동한 경우는 제외합니다.
-             */
-            if (frameTravelDistance >
-                MaximumAcceptedFrameTravelDistance)
-            {
-                Logger.LogWarning(
-                    LogPrefix +
-                    "Large position jump ignored." +
-                    " | FrameDistance=" +
-                    frameTravelDistance);
-
-                return;
-            }
-
-            DistanceFromLastCheckpoint +=
-                frameTravelDistance;
-        }
-
-        /// <summary>
-        /// 로컬 플레이어가 안전한 바닥에 일정 시간 동안
-        /// 안정적으로 서 있는지 검사합니다.
-        /// </summary>
-        private bool UpdateStableGroundState(
-            Character character)
-        {
-            if (character == null ||
-                character.data == null)
-            {
-                ResetStableGroundState();
-                return false;
-            }
-
-            bool validStandingState =
-                character.data.isGrounded &&
-                !character.data.isClimbing &&
-                !character.data.isRopeClimbing &&
-                !character.data.isVineClimbing &&
-                !character.data.dead &&
-                !character.data.fullyPassedOut &&
-                character.data.groundNormal.y >=
-                MinimumGroundNormalY;
-
-            if (!validStandingState)
-            {
-                ResetStableGroundState();
-                return false;
-            }
-
-            Vector3 currentGroundPosition =
-                character.data.groundPos;
-
-            if (!hasPreviousGroundPosition)
-            {
-                previousGroundPosition =
-                    currentGroundPosition;
-
-                hasPreviousGroundPosition =
-                    true;
-
-                stableGroundTimer =
-                    0f;
-
-                return false;
-            }
-
-            float deltaTime =
-                Mathf.Max(
-                    Time.deltaTime,
-                    0.0001f);
-
-            float movementSpeed =
-                Vector3.Distance(
-                    previousGroundPosition,
-                    currentGroundPosition) /
-                deltaTime;
-
-            previousGroundPosition =
-                currentGroundPosition;
-
-            if (movementSpeed <=
-                MaximumStableGroundSpeed)
-            {
-                stableGroundTimer +=
-                    Time.deltaTime;
-            }
-            else
-            {
-                stableGroundTimer =
-                    0f;
-            }
-
-            return stableGroundTimer >=
-                   RequiredStableTime;
-        }
-
-        private void ResetStableGroundState()
-        {
-            stableGroundTimer =
-                0f;
-
-            hasPreviousGroundPosition =
-                false;
-        }
-
-        /// <summary>
-        /// 현재 위치를 마지막 NestEgg 체크포인트로 저장합니다.
-        /// </summary>
-        private void SaveCheckpoint(
-            Character localCharacter,
-            bool initialCheckpoint)
-        {
-            Vector3 groundedEggPosition;
-
-            if (!TryGetGroundAttachedEggPosition(
-                    localCharacter,
-                    out groundedEggPosition))
-            {
-                Logger.LogWarning(
-                    LogPrefix +
-                    "Checkpoint save delayed: " +
-                    "safe ground was not found.");
-
-                return;
-            }
-
-            float completedTravelDistance =
-                DistanceFromLastCheckpoint;
-
-            CheckpointPosition =
-                groundedEggPosition;
-
-            CheckpointRotation =
-                eggRestRotation;
-
-            HasCheckpoint =
-                true;
-
-            CheckpointNumber++;
-
-            /*
-             * 새로운 체크포인트가 저장되었으므로
-             * 다음 체크포인트까지의 누적 이동거리를 초기화합니다.
-             */
-            DistanceFromLastCheckpoint =
-                0f;
-
-            waitingForStableCheckpoint =
-                false;
-
-            stableGroundTimer =
-                0f;
-
-            hasPreviousGroundPosition =
-                false;
-
-            /*
-             * 저장 직후 현재 플레이어 위치를 새 추적 기준으로 사용합니다.
-             */
-            if (localCharacter != null)
-            {
-                previousTrackedPosition =
-                    localCharacter.transform.position;
-
-                hasPreviousTrackedPosition =
-                    true;
-            }
-            else
-            {
-                hasPreviousTrackedPosition =
-                    false;
-            }
-
-            Logger.LogWarning(
-                LogPrefix +
-                (
-                    initialCheckpoint
-                        ? "Initial checkpoint saved."
-                        : "Travel checkpoint saved."
-                ) +
-                " | Number=" +
-                CheckpointNumber +
-                " | TravelDistance=" +
-                completedTravelDistance +
-                " | Position=" +
-                CheckpointPosition);
-        }
-
-        /// <summary>
-        /// NestEgg의 X/Z 위치 바로 아래 바닥을 우선 탐색합니다.
-        ///
-        /// 달걀이 절벽 밖으로 나가 있어 안전한 바닥을 찾지 못하면
-        /// 플레이어의 실제 groundPos 아래 바닥을 사용합니다.
-        /// </summary>
-        private bool TryGetGroundAttachedEggPosition(
-            Character localCharacter,
+        private bool TryGetSafeCheckpointPosition(
             out Vector3 result)
         {
             result =
                 Vector3.zero;
 
-            if (localCharacter == null ||
-                localCharacter.data == null)
+            if (item.itemState ==
+                    ItemState.Held &&
+                item.holderCharacter != null)
+            {
+                return TryGetSafeHeldEggPosition(
+                    item.holderCharacter,
+                    out result);
+            }
+
+            return TryGetGroundPositionBelowEgg(
+                InitialGroundCastDistance,
+                out result);
+        }
+
+        private bool TryGetSafeHeldEggPosition(
+            Character holder,
+            out Vector3 result)
+        {
+            result =
+                Vector3.zero;
+
+            if (!IsHolderOnSafeGround(
+                    holder))
             {
                 return false;
             }
 
             RaycastHit groundHit;
 
-            if (TryCastGroundBelowEgg(
-                    localCharacter,
+            if (TryCastGroundBelowHeldEgg(
+                    holder,
                     out groundHit))
             {
                 result =
                     groundHit.point +
                     Vector3.up *
-                    (
-                        pivotToEggBottom +
-                        GroundSurfacePadding
-                    );
+                    (pivotToEggBottom +
+                     GroundSurfacePadding);
 
                 return true;
             }
 
-            if (!TryCastGroundAtPlayer(
-                    localCharacter,
+            if (!TryCastGroundAtHolder(
+                    holder,
                     out groundHit))
             {
                 return false;
@@ -713,28 +272,68 @@ namespace Sapphire009.WatchEgg
             result =
                 groundHit.point +
                 Vector3.up *
-                (
-                    pivotToEggBottom +
-                    GroundSurfacePadding
-                );
+                (pivotToEggBottom +
+                 GroundSurfacePadding);
 
             return true;
         }
 
-        /// <summary>
-        /// 현재 들고 있는 NestEgg의 X/Z 바로 아래에서 바닥을 찾습니다.
-        /// </summary>
-        private bool TryCastGroundBelowEgg(
-            Character localCharacter,
+        private static bool IsHolderOnSafeGround(
+            Character holder)
+        {
+            if (holder == null ||
+                holder.data == null)
+            {
+                return false;
+            }
+
+            if (!holder.data.isGrounded)
+            {
+                return false;
+            }
+
+            if (holder.data.isClimbing ||
+                holder.data.isRopeClimbing ||
+                holder.data.isVineClimbing)
+            {
+                return false;
+            }
+
+            if (holder.data.dead ||
+                holder.data.fullyPassedOut)
+            {
+                return false;
+            }
+
+            if (holder.data.groundNormal.y <
+                MinimumGroundNormalY)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool TryCastGroundBelowHeldEgg(
+            Character holder,
             out RaycastHit groundHit)
         {
-            Vector3 playerGroundPosition =
-                localCharacter.data.groundPos;
+            groundHit =
+                default(RaycastHit);
+
+            if (holder == null ||
+                holder.data == null)
+            {
+                return false;
+            }
+
+            Vector3 holderGroundPosition =
+                holder.data.groundPos;
 
             Vector3 castOrigin =
                 new Vector3(
                     transform.position.x,
-                    playerGroundPosition.y +
+                    holderGroundPosition.y +
                     GroundCastStartHeight,
                     transform.position.z);
 
@@ -759,24 +358,31 @@ namespace Sapphire009.WatchEgg
 
             Vector3 horizontalDifference =
                 groundHit.point -
-                playerGroundPosition;
+                holderGroundPosition;
 
             horizontalDifference.y =
                 0f;
 
-            return horizontalDifference.magnitude <=
-                   MaximumEggGroundDistanceFromPlayer;
+            return horizontalDifference.sqrMagnitude <=
+                   MaximumEggGroundDistanceFromHolder *
+                   MaximumEggGroundDistanceFromHolder;
         }
 
-        /// <summary>
-        /// NestEgg 아래가 절벽이면 플레이어의 실제 발밑 바닥을 찾습니다.
-        /// </summary>
-        private bool TryCastGroundAtPlayer(
-            Character localCharacter,
+        private static bool TryCastGroundAtHolder(
+            Character holder,
             out RaycastHit groundHit)
         {
+            groundHit =
+                default(RaycastHit);
+
+            if (holder == null ||
+                holder.data == null)
+            {
+                return false;
+            }
+
             Vector3 castOrigin =
-                localCharacter.data.groundPos +
+                holder.data.groundPos +
                 Vector3.up *
                 GroundCastStartHeight;
 
@@ -797,16 +403,12 @@ namespace Sapphire009.WatchEgg
                    MinimumGroundNormalY;
         }
 
-        /// <summary>
-        /// 첫 번째 체크포인트가 아직 없을 때를 대비해
-        /// 최초 NestEgg 생성 위치 아래 바닥을 예비 체크포인트로 저장합니다.
-        /// </summary>
-        private void CacheInitialCheckpoint()
+        private bool TryGetGroundPositionBelowEgg(
+            float castDistance,
+            out Vector3 result)
         {
-            if (HasCheckpoint)
-            {
-                return;
-            }
+            result =
+                Vector3.zero;
 
             Vector3 castOrigin =
                 transform.position +
@@ -820,27 +422,100 @@ namespace Sapphire009.WatchEgg
                     GroundCastRadius,
                     Vector3.down,
                     out groundHit,
-                    InitialGroundCastDistance,
+                    castDistance,
                     HelperFunctions.GetMask(
                         HelperFunctions.LayerType.TerrainMap),
                     QueryTriggerInteraction.Ignore))
             {
-                return;
+                return false;
             }
 
             if (groundHit.normal.y <
                 MinimumGroundNormalY)
             {
+                return false;
+            }
+
+            result =
+                groundHit.point +
+                Vector3.up *
+                (pivotToEggBottom +
+                 GroundSurfacePadding);
+
+            return true;
+        }
+
+        private void SaveCheckpoint(
+            Vector3 newCheckpointPosition)
+        {
+            Vector3 previousCheckpointPosition =
+                CheckpointPosition;
+
+            float completedDistance =
+                Vector3.Distance(
+                    previousCheckpointPosition,
+                    newCheckpointPosition);
+
+            CheckpointPosition =
+                newCheckpointPosition;
+
+            CheckpointRotation =
+                eggRestRotation;
+
+            HasCheckpoint =
+                true;
+
+            CheckpointNumber++;
+
+            DistanceFromLastCheckpoint =
+                0f;
+
+            Logger.LogWarning(
+                LogPrefix +
+                "New 3D sphere checkpoint saved." +
+                " | Number=" +
+                CheckpointNumber +
+                " | Distance=" +
+                completedDistance +
+                " | PreviousPosition=" +
+                previousCheckpointPosition +
+                " | NewPosition=" +
+                CheckpointPosition);
+        }
+
+        private void CacheInitialCheckpoint()
+        {
+            if (HasCheckpoint)
+            {
                 return;
             }
 
+            Vector3 initialPosition;
+
+            if (!TryGetGroundPositionBelowEgg(
+                    InitialGroundCastDistance,
+                    out initialPosition))
+            {
+                if (item != null &&
+                    item.itemState ==
+                        ItemState.Held &&
+                    item.holderCharacter != null)
+                {
+                    if (!TryGetSafeHeldEggPosition(
+                            item.holderCharacter,
+                            out initialPosition))
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    return;
+                }
+            }
+
             CheckpointPosition =
-                groundHit.point +
-                Vector3.up *
-                (
-                    pivotToEggBottom +
-                    GroundSurfacePadding
-                );
+                initialPosition;
 
             CheckpointRotation =
                 eggRestRotation;
@@ -854,20 +529,13 @@ namespace Sapphire009.WatchEgg
             DistanceFromLastCheckpoint =
                 0f;
 
-            waitingForStableCheckpoint =
-                false;
-
             Logger.LogWarning(
                 LogPrefix +
-                "Initial spawn checkpoint cached." +
+                "Initial checkpoint cached." +
                 " | Position=" +
                 CheckpointPosition);
         }
 
-        /// <summary>
-        /// NestEgg Transform 피벗과 실제 콜라이더 최하단 사이의
-        /// 높이를 계산합니다.
-        /// </summary>
         private void CacheEggBottomOffset()
         {
             Collider[] colliders =
@@ -914,9 +582,6 @@ namespace Sapphire009.WatchEgg
                     true;
             }
 
-            /*
-             * 유효한 Collider를 찾지 못하면 Renderer 바운드를 사용합니다.
-             */
             if (!foundBounds)
             {
                 Renderer[] renderers =
@@ -983,9 +648,6 @@ namespace Sapphire009.WatchEgg
                 calculatedOffset;
         }
 
-        /// <summary>
-        /// YSpawn.cs에서 체크포인트 위치를 가져올 때 사용합니다.
-        /// </summary>
         public static bool TryGetCheckpoint(
             out Vector3 position,
             out Quaternion rotation)
@@ -999,9 +661,6 @@ namespace Sapphire009.WatchEgg
             return HasCheckpoint;
         }
 
-        /// <summary>
-        /// 현재 씬의 체크포인트 데이터를 초기화합니다.
-        /// </summary>
         public static void ResetCheckpoint()
         {
             HasCheckpoint =
@@ -1027,30 +686,27 @@ namespace Sapphire009.WatchEgg
 
         private static void ResetStaticDataWhenSceneChanged()
         {
-            int currentSceneHandle =
-                SceneManager
-                    .GetActiveScene()
-                    .handle;
+            Scene activeScene =
+                SceneManager.GetActiveScene();
 
             if (activeSceneHandle ==
-                currentSceneHandle)
+                activeScene.handle)
             {
                 return;
             }
 
             activeSceneHandle =
-                currentSceneHandle;
+                activeScene.handle;
 
             ResetCheckpoint();
 
             Logger.LogInfo(
                 LogPrefix +
-                "Scene changed. Checkpoint data reset.");
+                "Scene changed. Checkpoint data reset." +
+                " | Scene=" +
+                activeScene.name);
         }
 
-        /// <summary>
-        /// Item 인스턴스의 실제 프리팹 이름이 NestEgg인지 확인합니다.
-        /// </summary>
         public static bool IsNestEgg(
             Item targetItem)
         {
@@ -1089,23 +745,22 @@ namespace Sapphire009.WatchEgg
                 "(Clone)";
 
             while (normalized.EndsWith(
-                       cloneSuffix,
-                       StringComparison.OrdinalIgnoreCase))
+                cloneSuffix,
+                StringComparison.OrdinalIgnoreCase))
             {
                 normalized =
                     normalized.Substring(
                         0,
                         normalized.Length -
-                        cloneSuffix.Length)
-                    .Trim();
+                        cloneSuffix.Length);
+
+                normalized =
+                    normalized.Trim();
             }
 
             return normalized;
         }
 
-        /// <summary>
-        /// 모든 NestEgg 인스턴스에 EggCheckpoint를 자동 부착합니다.
-        /// </summary>
         [HarmonyPatch(
             typeof(Item),
             "Awake")]
@@ -1122,8 +777,7 @@ namespace Sapphire009.WatchEgg
                 }
 
                 if (__instance
-                        .GetComponent<EggCheckpoint>() !=
-                    null)
+                        .GetComponent<EggCheckpoint>() != null)
                 {
                     return;
                 }
@@ -1133,9 +787,6 @@ namespace Sapphire009.WatchEgg
             }
         }
 
-        /// <summary>
-        /// NestEgg가 깨질 때 파손 횟수를 증가시킵니다.
-        /// </summary>
         [HarmonyPatch(
             typeof(Breakable),
             nameof(Breakable.Break))]
@@ -1174,20 +825,29 @@ namespace Sapphire009.WatchEgg
                     return;
                 }
 
-                int viewId =
-                    brokenItem.photonView != null
-                        ? brokenItem.photonView.ViewID
-                        : brokenItem.gameObject
+                int brokenEggId;
+
+                if (brokenItem.photonView != null &&
+                    brokenItem.photonView.ViewID > 0)
+                {
+                    brokenEggId =
+                        brokenItem.photonView.ViewID;
+                }
+                else
+                {
+                    brokenEggId =
+                        brokenItem.gameObject
                             .GetInstanceID();
+                }
 
                 if (CountedBrokenViewIds.Contains(
-                        viewId))
+                        brokenEggId))
                 {
                     return;
                 }
 
                 CountedBrokenViewIds.Add(
-                    viewId);
+                    brokenEggId);
 
                 BrokenEggCount++;
 
@@ -1196,8 +856,8 @@ namespace Sapphire009.WatchEgg
                     "NestEgg broken." +
                     " | BrokenCount=" +
                     BrokenEggCount +
-                    " | ViewID=" +
-                    viewId);
+                    " | EggID=" +
+                    brokenEggId);
             }
         }
     }
