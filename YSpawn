@@ -1,3 +1,4 @@
+using System.Collections;
 using BepInEx.Logging;
 using HarmonyLib;
 using Photon.Pun;
@@ -7,14 +8,15 @@ using UnityEngine.SceneManagement;
 namespace Sapphire009.WatchEgg
 {
     /// <summary>
-    /// NestEgg가 깨진 뒤 호스트가 Y키를 누르면
-    /// 마지막 EggCheckpoint 위치에 새 NestEgg를 생성합니다.
+    /// NestEgg가 깨지면 마지막 체크포인트에
+    /// 새로운 NestEgg를 자동으로 생성합니다.
     ///
-    /// 생성된 NestEgg는 플레이어가 직접 집기 전까지
-    /// Kinematic 상태로 고정되어 굴러가거나 깨지지 않습니다.
+    /// Y키는 자동 생성이 실패했거나,
+    /// 달걀이 맵 밖으로 사라진 상황에서 사용하는
+    /// 비상 수동 복구 기능으로 유지합니다.
     ///
-    /// 플레이어를 체크포인트로 이동시키지 않으며
-    /// 달걀만 마지막 체크포인트에 생성합니다.
+    /// 월드, 플레이어 인벤토리, 백팩에 NestEgg가 남아 있으면
+    /// 중복 생성하지 않습니다.
     ///
     /// Developer: Sapphire009
     /// File: YSpawn.cs
@@ -30,17 +32,36 @@ namespace Sapphire009.WatchEgg
         public const string TargetPrefabName =
             "NestEgg";
 
-        public const KeyCode SpawnKey =
+        public const KeyCode EmergencySpawnKey =
             KeyCode.Y;
 
         private const string LogPrefix =
             "[YSpawn] ";
 
         /// <summary>
-        /// Y키 연속 입력으로 같은 파손에
-        /// 달걀이 여러 개 생성되는 것을 방지합니다.
+        /// 달걀이 깨진 직후 기존 오브젝트와 파손 효과가
+        /// 정리될 때까지 기다리는 시간입니다.
         /// </summary>
-        private const float InputCooldown =
+        private const float AutomaticInitialDelay =
+            1.25f;
+
+        /// <summary>
+        /// 깨진 NestEgg 오브젝트가 아직 남아 있으면
+        /// 이 간격으로 다시 확인합니다.
+        /// </summary>
+        private const float AutomaticRetryInterval =
+            0.5f;
+
+        /// <summary>
+        /// 자동 생성이 기존 달걀 제거를 기다리는 최대 시간입니다.
+        ///
+        /// 이 시간 안에 자동 복구하지 못하면
+        /// Y키 비상 복구를 사용할 수 있습니다.
+        /// </summary>
+        private const float AutomaticRetryTimeout =
+            10f;
+
+        private const float EmergencyInputCooldown =
             0.75f;
 
         private static readonly ManualLogSource Logger =
@@ -48,12 +69,16 @@ namespace Sapphire009.WatchEgg
                 "WatchEgg.YSpawn");
 
         /// <summary>
-        /// 현재 씬에서 이미 처리한 파손 횟수입니다.
-        ///
-        /// BrokenEggCount가 이 값보다 커야
-        /// 새 달걀을 생성할 수 있습니다.
+        /// 새 NestEgg 생성까지 완료한 파손 횟수입니다.
         /// </summary>
         private static int handledBrokenEggCount;
+
+        /// <summary>
+        /// 자동 생성 시도를 이미 시작한 파손 횟수입니다.
+        ///
+        /// 동일 파손에 대해 자동 코루틴이 반복 생성되는 것을 막습니다.
+        /// </summary>
+        private static int automaticAttemptedBrokenEggCount;
 
         private static int currentSceneHandle =
             int.MinValue;
@@ -61,7 +86,9 @@ namespace Sapphire009.WatchEgg
         private static int lastProcessedFrame =
             -1;
 
-        private static float nextAllowedInputTime;
+        private static float nextAllowedEmergencyInputTime;
+
+        private static bool automaticRespawnRoutineRunning;
 
         [HarmonyPrepare]
         private static bool Prepare()
@@ -74,11 +101,11 @@ namespace Sapphire009.WatchEgg
         }
 
         /// <summary>
-        /// CharacterSpawner.Update가 여러 인스턴스에서 호출되더라도
-        /// 한 프레임에 Y키 입력을 한 번만 처리합니다.
+        /// 한 프레임에 한 번만 자동 복구와 Y키 입력을 처리합니다.
         /// </summary>
         [HarmonyPostfix]
-        private static void Postfix()
+        private static void Postfix(
+            CharacterSpawner __instance)
         {
             ResetWhenSceneChanged();
 
@@ -91,53 +118,270 @@ namespace Sapphire009.WatchEgg
             lastProcessedFrame =
                 Time.frameCount;
 
+            /*
+             * 깨짐 횟수가 증가하면 자동 복구를 시작합니다.
+             */
+            TryStartAutomaticRespawn(
+                __instance);
+
+            /*
+             * Y키는 자동 복구와 별개의 비상 수동 복구입니다.
+             */
             if (!Input.GetKeyDown(
-                    SpawnKey))
+                    EmergencySpawnKey))
             {
                 return;
             }
 
             if (Time.unscaledTime <
-                nextAllowedInputTime)
+                nextAllowedEmergencyInputTime)
             {
                 return;
             }
 
-            nextAllowedInputTime =
+            nextAllowedEmergencyInputTime =
                 Time.unscaledTime +
-                InputCooldown;
+                EmergencyInputCooldown;
 
-            TrySpawnNestEgg();
+            TrySpawnNestEgg(
+                true,
+                EggCheckpoint.BrokenEggCount);
         }
 
         /// <summary>
-        /// Y키 입력 시 체크포인트와 파손 상태를 검사한 뒤
-        /// NestEgg를 네트워크 생성합니다.
+        /// BrokenEggCount 증가를 감지하여 자동 복구 코루틴을 시작합니다.
         /// </summary>
-        private static void TrySpawnNestEgg()
+        private static void TryStartAutomaticRespawn(
+            CharacterSpawner coroutineOwner)
         {
-            if (!PhotonNetwork.InRoom)
+            if (coroutineOwner == null ||
+                automaticRespawnRoutineRunning)
             {
-                Logger.LogWarning(
-                    LogPrefix +
-                    "Spawn cancelled: " +
-                    "Photon room is not ready.");
+                return;
+            }
 
+            if (!PhotonNetwork.InRoom ||
+                PhotonNetwork.CurrentRoom == null ||
+                !PhotonNetwork.IsMasterClient)
+            {
+                return;
+            }
+
+            if (!EggCheckpoint.HasCheckpoint)
+            {
+                return;
+            }
+
+            int brokenEggCount =
+                EggCheckpoint.BrokenEggCount;
+
+            if (brokenEggCount <= 0)
+            {
                 return;
             }
 
             /*
-             * 아이템 생성 권한은 호스트만 가집니다.
-             * 클라이언트가 각자 생성하면 달걀이 중복될 수 있습니다.
+             * 이미 해당 파손에 대해 새 달걀을 생성했습니다.
              */
-            if (!PhotonNetwork.IsMasterClient)
+            if (brokenEggCount <=
+                handledBrokenEggCount)
+            {
+                return;
+            }
+
+            /*
+             * 해당 파손에 대해 자동 복구 시도를 이미 시작했습니다.
+             */
+            if (brokenEggCount <=
+                automaticAttemptedBrokenEggCount)
+            {
+                return;
+            }
+
+            automaticAttemptedBrokenEggCount =
+                brokenEggCount;
+
+            automaticRespawnRoutineRunning =
+                true;
+
+            int startedSceneHandle =
+                SceneManager
+                    .GetActiveScene()
+                    .handle;
+
+            coroutineOwner.StartCoroutine(
+                AutomaticRespawnRoutine(
+                    startedSceneHandle,
+                    brokenEggCount));
+        }
+
+        /// <summary>
+        /// 깨진 NestEgg 오브젝트가 제거될 때까지 기다린 뒤
+        /// 체크포인트에 새 NestEgg를 자동 생성합니다.
+        /// </summary>
+        private static IEnumerator AutomaticRespawnRoutine(
+            int startedSceneHandle,
+            int triggeringBrokenEggCount)
+        {
+            Logger.LogWarning(
+                LogPrefix +
+                "NestEgg break detected. " +
+                "Automatic checkpoint respawn scheduled." +
+                " | BrokenCount=" +
+                triggeringBrokenEggCount);
+
+            yield return
+                new WaitForSecondsRealtime(
+                    AutomaticInitialDelay);
+
+            float timeoutTime =
+                Time.unscaledTime +
+                AutomaticRetryTimeout;
+
+            while (true)
+            {
+                if (!CanContinueAutomaticRespawn(
+                        startedSceneHandle))
+                {
+                    automaticRespawnRoutineRunning =
+                        false;
+
+                    yield break;
+                }
+
+                /*
+                 * Y키나 다른 경로로 이미 복구했다면 종료합니다.
+                 */
+                if (handledBrokenEggCount >=
+                    triggeringBrokenEggCount)
+                {
+                    automaticRespawnRoutineRunning =
+                        false;
+
+                    yield break;
+                }
+
+                string existingEggLocation;
+
+                bool existingEggFound =
+                    TryFindExistingNestEgg(
+                        out existingEggLocation);
+
+                if (!existingEggFound)
+                {
+                    bool spawnSucceeded =
+                        TrySpawnNestEgg(
+                            false,
+                            triggeringBrokenEggCount);
+
+                    if (spawnSucceeded)
+                    {
+                        automaticRespawnRoutineRunning =
+                            false;
+
+                        yield break;
+                    }
+                }
+
+                if (Time.unscaledTime >=
+                    timeoutTime)
+                {
+                    Logger.LogError(
+                        LogPrefix +
+                        "Automatic checkpoint respawn timed out." +
+                        " Use Y for emergency recovery." +
+                        " | BrokenCount=" +
+                        triggeringBrokenEggCount +
+                        " | ExistingEgg=" +
+                        (
+                            existingEggFound
+                                ? existingEggLocation
+                                : "None"
+                        ));
+
+                    automaticRespawnRoutineRunning =
+                        false;
+
+                    yield break;
+                }
+
+                yield return
+                    new WaitForSecondsRealtime(
+                        AutomaticRetryInterval);
+            }
+        }
+
+        /// <summary>
+        /// 자동 복구 코루틴을 계속 실행할 수 있는지 확인합니다.
+        /// </summary>
+        private static bool CanContinueAutomaticRespawn(
+            int startedSceneHandle)
+        {
+            if (SceneManager
+                    .GetActiveScene()
+                    .handle !=
+                startedSceneHandle)
+            {
+                return false;
+            }
+
+            if (!PhotonNetwork.InRoom ||
+                PhotonNetwork.CurrentRoom == null ||
+                !PhotonNetwork.IsMasterClient)
+            {
+                return false;
+            }
+
+            if (!EggCheckpoint.HasCheckpoint)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// 체크포인트에 새 NestEgg를 생성합니다.
+        ///
+        /// emergencyRequest가 true이면 Y키 비상 복구입니다.
+        /// 비상 복구는 BrokenEggCount가 증가하지 않았더라도
+        /// 현재 NestEgg가 완전히 사라진 경우 사용할 수 있습니다.
+        /// </summary>
+        private static bool TrySpawnNestEgg(
+            bool emergencyRequest,
+            int triggeringBrokenEggCount)
+        {
+            string requestType =
+                emergencyRequest
+                    ? "Emergency Y"
+                    : "Automatic";
+
+            if (!PhotonNetwork.InRoom ||
+                PhotonNetwork.CurrentRoom == null)
             {
                 Logger.LogWarning(
                     LogPrefix +
-                    "Spawn cancelled: " +
-                    "only the host can use Y spawn.");
+                    requestType +
+                    " spawn cancelled: " +
+                    "Photon room is not ready.");
 
-                return;
+                return false;
+            }
+
+            /*
+             * 한 명만 생성해야 하므로 호스트만 처리합니다.
+             */
+            if (!PhotonNetwork.IsMasterClient)
+            {
+                if (emergencyRequest)
+                {
+                    Logger.LogWarning(
+                        LogPrefix +
+                        "Emergency Y spawn cancelled: " +
+                        "only the host can restore the egg.");
+                }
+
+                return false;
             }
 
             Character localCharacter =
@@ -148,44 +392,11 @@ namespace Sapphire009.WatchEgg
             {
                 Logger.LogWarning(
                     LogPrefix +
-                    "Spawn cancelled: " +
+                    requestType +
+                    " spawn cancelled: " +
                     "local character is not ready.");
 
-                return;
-            }
-
-            /*
-             * 달걀이 한 번 이상 깨진 뒤에만 Y키 생성을 허용합니다.
-             */
-            int currentBrokenCount =
-                EggCheckpoint.BrokenEggCount;
-
-            if (currentBrokenCount <= 0)
-            {
-                Logger.LogWarning(
-                    LogPrefix +
-                    "Spawn cancelled: " +
-                    "NestEgg has not been broken.");
-
-                return;
-            }
-
-            /*
-             * 같은 파손 횟수에 대해 이미 한 번 생성했다면
-             * 추가 생성하지 않습니다.
-             */
-            if (currentBrokenCount <=
-                handledBrokenEggCount)
-            {
-                Logger.LogWarning(
-                    LogPrefix +
-                    "Spawn cancelled: " +
-                    "replacement was already spawned " +
-                    "for the current break." +
-                    " | BrokenCount=" +
-                    currentBrokenCount);
-
-                return;
+                return false;
             }
 
             Vector3 checkpointPosition;
@@ -197,31 +408,35 @@ namespace Sapphire009.WatchEgg
             {
                 Logger.LogWarning(
                     LogPrefix +
-                    "Spawn cancelled: " +
+                    requestType +
+                    " spawn cancelled: " +
                     "no checkpoint has been saved.");
 
-                return;
+                return false;
             }
 
             /*
-             * 현재 맵에 살아 있는 NestEgg가 하나라도 있으면
-             * 중복 생성을 막습니다.
+             * 월드뿐 아니라 플레이어 인벤토리와 백팩도 검사합니다.
+             *
+             * 달걀이 다른 슬롯에 보관된 상태에서
+             * 새 달걀이 중복 생성되는 것을 막습니다.
              */
-            Item existingNestEgg;
+            string existingEggLocation;
 
             if (TryFindExistingNestEgg(
-                    out existingNestEgg))
+                    out existingEggLocation))
             {
-                Logger.LogWarning(
-                    LogPrefix +
-                    "Spawn cancelled: " +
-                    "an existing NestEgg was found." +
-                    " | Object=" +
-                    existingNestEgg.gameObject.name +
-                    " | Position=" +
-                    existingNestEgg.transform.position);
+                if (emergencyRequest)
+                {
+                    Logger.LogWarning(
+                        LogPrefix +
+                        "Emergency Y spawn cancelled: " +
+                        "a NestEgg still exists." +
+                        " | Location=" +
+                        existingEggLocation);
+                }
 
-                return;
+                return false;
             }
 
             GameObject spawnedObject;
@@ -238,20 +453,22 @@ namespace Sapphire009.WatchEgg
             {
                 Logger.LogError(
                     LogPrefix +
-                    "Photon spawn failed." +
+                    requestType +
+                    " Photon spawn failed." +
                     " | Exception=" +
                     exception);
 
-                return;
+                return false;
             }
 
             if (spawnedObject == null)
             {
                 Logger.LogError(
                     LogPrefix +
-                    "Photon spawn returned null.");
+                    requestType +
+                    " spawn returned null.");
 
-                return;
+                return false;
             }
 
             PhotonView spawnedView =
@@ -263,19 +480,14 @@ namespace Sapphire009.WatchEgg
                     LogPrefix +
                     "Spawned NestEgg has no PhotonView.");
 
-                /*
-                 * 네트워크 오브젝트인데 PhotonView가 없으면
-                 * 정상 동기화할 수 없으므로 호스트가 제거합니다.
-                 */
                 PhotonNetwork.Destroy(
                     spawnedObject);
 
-                return;
+                return false;
             }
 
             /*
-             * RPC가 다른 플레이어에게 전달되기 전에
-             * 호스트 화면에서도 즉시 정확한 위치로 고정합니다.
+             * 호스트 화면에서 즉시 체크포인트 위치로 고정합니다.
              */
             spawnedObject.transform.SetPositionAndRotation(
                 checkpointPosition,
@@ -299,10 +511,10 @@ namespace Sapphire009.WatchEgg
             }
 
             /*
-             * 모든 플레이어 화면에서 NestEgg를 Kinematic으로 고정합니다.
+             * 모든 플레이어 화면에서 동일한 위치와
+             * Kinematic 상태를 적용합니다.
              *
-             * 플레이어가 직접 집으면 원본 PEAK의 픽업 처리가
-             * 지상 NestEgg를 제거하고 손에 드는 아이템으로 전환합니다.
+             * 플레이어가 직접 집기 전까지 굴러가거나 깨지지 않습니다.
              */
             spawnedView.RPC(
                 "SetKinematicRPC",
@@ -315,39 +527,68 @@ namespace Sapphire009.WatchEgg
                 });
 
             handledBrokenEggCount =
-                currentBrokenCount;
+                Mathf.Max(
+                    handledBrokenEggCount,
+                    Mathf.Max(
+                        triggeringBrokenEggCount,
+                        EggCheckpoint.BrokenEggCount));
 
             Logger.LogWarning(
                 LogPrefix +
-                "Replacement NestEgg spawned at checkpoint." +
+                requestType +
+                " NestEgg spawned at checkpoint." +
                 " | BrokenCount=" +
-                currentBrokenCount +
+                EggCheckpoint.BrokenEggCount +
                 " | CheckpointNumber=" +
                 EggCheckpoint.CheckpointNumber +
                 " | Position=" +
                 checkpointPosition +
                 " | ViewID=" +
                 spawnedView.ViewID);
+
+            return true;
         }
 
         /// <summary>
-        /// 활성화된 현재 씬 오브젝트 중
-        /// 실제 NestEgg Item을 찾습니다.
-        ///
-        /// 이 검사는 Y키를 눌렀을 때만 실행되므로
-        /// 매 프레임 전체 아이템을 검색하지 않습니다.
+        /// 월드, 손, 일반 인벤토리, 백팩을 모두 검사하여
+        /// 현재 존재하는 NestEgg를 찾습니다.
         /// </summary>
         private static bool TryFindExistingNestEgg(
-            out Item foundItem)
+            out string existingLocation)
         {
-            foundItem =
-                null;
+            existingLocation =
+                string.Empty;
+
+            if (TryFindWorldNestEgg(
+                    out existingLocation))
+            {
+                return true;
+            }
+
+            if (TryFindInventoryNestEgg(
+                    out existingLocation))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 현재 씬에 활성화된 NestEgg 오브젝트가 있는지 검사합니다.
+        /// 손에 든 NestEgg도 활성 Item이므로 여기서 발견됩니다.
+        /// </summary>
+        private static bool TryFindWorldNestEgg(
+            out string existingLocation)
+        {
+            existingLocation =
+                string.Empty;
 
             Item[] allItems =
-                UnityEngine.Object.FindObjectsOfType<Item>();
+                UnityEngine.Object
+                    .FindObjectsOfType<Item>();
 
-            if (allItems == null ||
-                allItems.Length == 0)
+            if (allItems == null)
             {
                 return false;
             }
@@ -371,14 +612,17 @@ namespace Sapphire009.WatchEgg
                     continue;
                 }
 
-                if (!EggCheckpoint.IsNestEgg(
-                        currentItem))
+                if (!IsNestEggName(
+                        currentItem.gameObject.name))
                 {
                     continue;
                 }
 
-                foundItem =
-                    currentItem;
+                existingLocation =
+                    "World: " +
+                    currentItem.gameObject.name +
+                    " at " +
+                    currentItem.transform.position;
 
                 return true;
             }
@@ -387,7 +631,203 @@ namespace Sapphire009.WatchEgg
         }
 
         /// <summary>
-        /// 씬이 바뀌면 이전 맵의 파손 처리 상태를 초기화합니다.
+        /// 모든 플레이어의 일반 인벤토리와 백팩 내부를 검사합니다.
+        /// </summary>
+        private static bool TryFindInventoryNestEgg(
+            out string existingLocation)
+        {
+            existingLocation =
+                string.Empty;
+
+            if (Character.AllCharacters == null)
+            {
+                return false;
+            }
+
+            foreach (
+                Character character
+                in Character.AllCharacters)
+            {
+                if (character == null ||
+                    character.player == null)
+                {
+                    continue;
+                }
+
+                string characterName =
+                    GetCharacterName(
+                        character);
+
+                /*
+                 * 일반 인벤토리 슬롯 검사
+                 */
+                ItemSlot[] itemSlots =
+                    character.player.itemSlots;
+
+                if (itemSlots != null)
+                {
+                    for (int i = 0;
+                         i < itemSlots.Length;
+                         i++)
+                    {
+                        ItemSlot itemSlot =
+                            itemSlots[i];
+
+                        if (itemSlot == null ||
+                            itemSlot.prefab == null)
+                        {
+                            continue;
+                        }
+
+                        if (!IsNestEggName(
+                                itemSlot.prefab.gameObject.name))
+                        {
+                            continue;
+                        }
+
+                        existingLocation =
+                            "Inventory: " +
+                            characterName +
+                            " Slot=" +
+                            itemSlot.itemSlotID;
+
+                        return true;
+                    }
+                }
+
+                /*
+                 * 백팩 내부 슬롯 검사
+                 */
+                ItemSlot backpackSlot =
+                    character.player.backpackSlot;
+
+                if (backpackSlot == null ||
+                    backpackSlot.IsEmpty() ||
+                    backpackSlot.data == null)
+                {
+                    continue;
+                }
+
+                BackpackData backpackData;
+
+                if (!backpackSlot.data
+                        .TryGetDataEntry<BackpackData>(
+                            DataEntryKey.BackpackData,
+                            out backpackData))
+                {
+                    continue;
+                }
+
+                if (backpackData == null ||
+                    backpackData.itemSlots == null)
+                {
+                    continue;
+                }
+
+                for (int i = 0;
+                     i < backpackData.itemSlots.Length;
+                     i++)
+                {
+                    ItemSlot backpackItemSlot =
+                        backpackData.itemSlots[i];
+
+                    if (backpackItemSlot == null ||
+                        backpackItemSlot.prefab == null)
+                    {
+                        continue;
+                    }
+
+                    if (!IsNestEggName(
+                            backpackItemSlot
+                                .prefab
+                                .gameObject
+                                .name))
+                    {
+                        continue;
+                    }
+
+                    existingLocation =
+                        "Backpack: " +
+                        characterName +
+                        " Slot=" +
+                        backpackItemSlot.itemSlotID;
+
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsNestEggName(
+            string objectName)
+        {
+            return string.Equals(
+                NormalizeObjectName(
+                    objectName),
+                TargetPrefabName,
+                System.StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string NormalizeObjectName(
+            string objectName)
+        {
+            if (string.IsNullOrEmpty(
+                    objectName))
+            {
+                return string.Empty;
+            }
+
+            string normalized =
+                objectName.Trim();
+
+            const string cloneSuffix =
+                "(Clone)";
+
+            while (normalized.EndsWith(
+                       cloneSuffix,
+                       System.StringComparison.OrdinalIgnoreCase))
+            {
+                normalized =
+                    normalized.Substring(
+                        0,
+                        normalized.Length -
+                        cloneSuffix.Length)
+                    .Trim();
+            }
+
+            return normalized;
+        }
+
+        private static string GetCharacterName(
+            Character character)
+        {
+            if (character == null)
+            {
+                return "Unknown";
+            }
+
+            if (character.photonView != null &&
+                character.photonView.Owner != null)
+            {
+                string nickname =
+                    character
+                        .photonView
+                        .Owner
+                        .NickName;
+
+                if (!string.IsNullOrEmpty(
+                        nickname))
+                {
+                    return nickname;
+                }
+            }
+
+            return character.gameObject.name;
+        }
+
+        /// <summary>
+        /// 씬 변경 시 이전 맵의 자동 복구 상태를 초기화합니다.
         /// </summary>
         private static void ResetWhenSceneChanged()
         {
@@ -398,13 +838,16 @@ namespace Sapphire009.WatchEgg
                 activeScene.handle)
             {
                 /*
-                 * EggCheckpoint가 현재 씬 데이터를 초기화한 경우
-                 * YSpawn의 처리 횟수도 함께 초기화합니다.
+                 * EggCheckpoint에서 씬 데이터를 초기화했다면
+                 * YSpawn의 카운트도 함께 초기화합니다.
                  */
                 if (EggCheckpoint.BrokenEggCount <
                     handledBrokenEggCount)
                 {
                     handledBrokenEggCount =
+                        0;
+
+                    automaticAttemptedBrokenEggCount =
                         0;
                 }
 
@@ -417,16 +860,22 @@ namespace Sapphire009.WatchEgg
             handledBrokenEggCount =
                 0;
 
+            automaticAttemptedBrokenEggCount =
+                0;
+
             lastProcessedFrame =
                 -1;
 
-            nextAllowedInputTime =
+            nextAllowedEmergencyInputTime =
                 0f;
+
+            automaticRespawnRoutineRunning =
+                false;
 
             Logger.LogInfo(
                 LogPrefix +
                 "Scene changed. " +
-                "Y spawn state reset." +
+                "Respawn state reset." +
                 " | Scene=" +
                 activeScene.name);
         }
