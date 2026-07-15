@@ -10,14 +10,14 @@ namespace Sapphire009.WatchEgg
     /// <summary>
     /// NestEgg 전용 3차원 구형 체크포인트입니다.
     ///
-    /// 마지막 체크포인트를 중심으로 반지름 30m의 구형 범위를 계산합니다.
+    /// 마지막 체크포인트를 중심으로 반지름 50m의 구형 범위를 계산합니다.
     ///
-    /// 실제 달걀이 기존 체크포인트에서 30m 이상 떨어졌으며,
+    /// 실제 달걀이 기존 체크포인트에서 50m 이상 떨어졌으며,
     /// 그 순간 반드시 누군가가 달걀을 손에 들고 있고,
     /// 운반자가 안전한 바닥에 있을 때만 새 체크포인트를 저장합니다.
     ///
     /// 바닥에 놓인 달걀, 던져진 달걀, 굴러가는 달걀만
-    /// 30m 범위를 벗어나는 경우에는 체크포인트를 갱신하지 않습니다.
+    /// 50m 범위를 벗어나는 경우에는 체크포인트를 갱신하지 않습니다.
     ///
     /// X, Y, Z를 모두 계산하므로 수평, 수직, 대각선 이동이
     /// 모두 동일하게 적용됩니다.
@@ -38,7 +38,7 @@ namespace Sapphire009.WatchEgg
         /// 3차원 구형 범위의 반지름입니다.
         /// </summary>
         public const float TargetCheckpointDistance =
-            30f;
+            50f;
 
         private const float TargetCheckpointDistanceSquared =
             TargetCheckpointDistance *
@@ -188,7 +188,7 @@ namespace Sapphire009.WatchEgg
                 Mathf.Sqrt(distanceSquared);
 
             /*
-             * 마지막 체크포인트 중심의 반지름 30m 구형 범위 안이면
+             * 마지막 체크포인트 중심의 반지름 50m 구형 범위 안이면
              * 기존 체크포인트를 유지합니다.
              */
             if (distanceSquared <
@@ -198,7 +198,7 @@ namespace Sapphire009.WatchEgg
             }
 
             /*
-             * 달걀이 30m 범위를 벗어났더라도
+             * 달걀이 50m 범위를 벗어났더라도
              * 현재 누군가의 손에 들려 있지 않으면
              * 체크포인트를 갱신하지 않습니다.
              */
@@ -214,7 +214,7 @@ namespace Sapphire009.WatchEgg
             /*
              * 달걀 운반자가 안전한 바닥에 있어야 합니다.
              *
-             * 수직 등반 도중 30m를 넘어가더라도
+             * 수직 등반 도중 50m를 넘어가더라도
              * 등반 중이나 공중에서는 저장하지 않습니다.
              */
             if (!IsHolderOnSafeGround(holder))
@@ -233,7 +233,7 @@ namespace Sapphire009.WatchEgg
 
             /*
              * 실제 저장될 안전한 위치도
-             * 기존 체크포인트에서 30m 이상 떨어져 있어야 합니다.
+             * 기존 체크포인트에서 50m 이상 떨어져 있어야 합니다.
              */
             Vector3 checkpointToSafePosition =
                 safeCheckpointPosition -
