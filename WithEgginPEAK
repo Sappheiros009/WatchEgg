@@ -1,0 +1,393 @@
+using System;
+using System.Collections.Generic;
+using BepInEx.Logging;
+using HarmonyLib;
+using UnityEngine;
+using Zorro.Core;
+
+namespace Sapphire009.WatchEgg
+{
+    /// <summary>
+    /// 정상에서 조명탄을 점화하려면 NestEgg가 조명탄 반경 안에 있어야 합니다.
+    ///
+    /// 달걀은 플레이어가 손에 들고 있거나 정상 주변 바닥에 놓여 있어도 인정됩니다.
+    /// 정상 이외의 지역에서 조명탄을 사용하는 원본 동작에는 영향을 주지 않습니다.
+    ///
+    /// Developer: Sapphire009
+    /// File: WithEgginPEAK.cs
+    /// </summary>
+    public static class WithEgginPEAK
+    {
+        public const string DeveloperName = "Sapphire009";
+        public const string TargetPrefabName = "NestEgg";
+
+        /// <summary>
+        /// 정상 조명탄 점화가 허용되는 달걀의 최대 거리입니다.
+        /// 기존 WithEgg.cs와 동일하게 15 유닛을 사용합니다.
+        /// </summary>
+        public const float RequiredEggRange = 15f;
+
+        private const string LogPrefix = "[WithEgginPEAK] ";
+        private const string RequirementText = "BRING THE EGG TO THE SUMMIT FLARE";
+
+        private static readonly ManualLogSource Logger =
+            BepInEx.Logging.Logger.CreateLogSource("WatchEgg.WithEgginPEAK");
+
+        /// <summary>
+        /// 현재 씬에 존재하는 NestEgg 인스턴스 목록입니다.
+        /// 조명탄을 사용할 때마다 모든 Item을 검색하지 않도록 Item.Awake에서 등록합니다.
+        /// </summary>
+        private static readonly List<Item> ActiveNestEggs = new List<Item>();
+
+        private static void RegisterNestEgg(Item item)
+        {
+            if (!IsNestEgg(item))
+            {
+                return;
+            }
+
+            if (!ActiveNestEggs.Contains(item))
+            {
+                ActiveNestEggs.Add(item);
+            }
+
+            WithEgginPEAKTracker tracker = item.GetComponent<WithEgginPEAKTracker>();
+            if (tracker == null)
+            {
+                tracker = item.gameObject.AddComponent<WithEgginPEAKTracker>();
+            }
+
+            tracker.Initialize(item);
+
+            Logger.LogInfo(
+                LogPrefix +
+                "NestEgg registered." +
+                " | Object=" + item.gameObject.name);
+        }
+
+        internal static void UnregisterNestEgg(Item item)
+        {
+            for (int i = ActiveNestEggs.Count - 1; i >= 0; i--)
+            {
+                Item registeredItem = ActiveNestEggs[i];
+                if (registeredItem == null || registeredItem == item)
+                {
+                    ActiveNestEggs.RemoveAt(i);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 현재 조명탄이 정상 구역에 있는지 검사합니다.
+        /// 조명탄을 들고 있다면 플레이어 중심 위치를 기준으로 검사합니다.
+        /// </summary>
+        private static bool IsFlareAtPeak(Flare flare)
+        {
+            if (flare == null || flare.item == null)
+            {
+                return false;
+            }
+
+            MountainProgressHandler progressHandler =
+                Singleton<MountainProgressHandler>.Instance;
+
+            if (progressHandler == null)
+            {
+                return false;
+            }
+
+            Vector3 flarePosition = GetFlareAnchorPosition(flare);
+            return progressHandler.IsAtPeak(flarePosition);
+        }
+
+        /// <summary>
+        /// 조명탄과 달걀의 거리 계산에 사용할 기준 위치를 반환합니다.
+        /// </summary>
+        private static Vector3 GetFlareAnchorPosition(Flare flare)
+        {
+            if (flare != null &&
+                flare.item != null &&
+                flare.item.holderCharacter != null)
+            {
+                return flare.item.holderCharacter.Center;
+            }
+
+            if (flare != null && flare.item != null)
+            {
+                return flare.item.transform.position;
+            }
+
+            return Vector3.zero;
+        }
+
+        /// <summary>
+        /// 정상 조명탄 주변에 NestEgg가 있는지 검사합니다.
+        ///
+        /// 인정되는 상태:
+        /// 1. 플레이어가 현재 손에 들고 있는 NestEgg
+        /// 2. 정상 주변 바닥에 놓여 있는 활성 NestEgg
+        ///
+        /// 인벤토리나 가방 안에 들어간 달걀은 인정하지 않습니다.
+        /// </summary>
+        private static bool IsNestEggInFlareRange(
+            Flare flare,
+            out float nearestDistance)
+        {
+            nearestDistance = float.PositiveInfinity;
+
+            if (flare == null || flare.item == null)
+            {
+                return false;
+            }
+
+            Vector3 flarePosition = GetFlareAnchorPosition(flare);
+            List<Character> characters = PlayerHandler.GetAllPlayerCharacters();
+
+            if (characters != null)
+            {
+                foreach (Character character in characters)
+                {
+                    if (character == null || character.data == null)
+                    {
+                        continue;
+                    }
+
+                    Item heldItem = character.data.currentItem;
+                    if (!IsNestEgg(heldItem))
+                    {
+                        continue;
+                    }
+
+                    float heldEggDistance = Vector3.Distance(
+                        flarePosition,
+                        character.Center);
+
+                    if (heldEggDistance < nearestDistance)
+                    {
+                        nearestDistance = heldEggDistance;
+                    }
+
+                    if (heldEggDistance <= RequiredEggRange)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            for (int i = ActiveNestEggs.Count - 1; i >= 0; i--)
+            {
+                Item eggItem = ActiveNestEggs[i];
+
+                if (eggItem == null || eggItem.gameObject == null)
+                {
+                    ActiveNestEggs.RemoveAt(i);
+                    continue;
+                }
+
+                if (!IsNestEgg(eggItem))
+                {
+                    ActiveNestEggs.RemoveAt(i);
+                    continue;
+                }
+
+                // 손에 든 달걀은 위에서 플레이어 중심 위치로 이미 검사했습니다.
+                if (eggItem.itemState == ItemState.Held)
+                {
+                    continue;
+                }
+
+                // 가방이나 인벤토리 안의 달걀은 조건을 충족한 것으로 인정하지 않습니다.
+                if (eggItem.itemState != ItemState.Ground)
+                {
+                    continue;
+                }
+
+                if (!eggItem.gameObject.activeInHierarchy)
+                {
+                    continue;
+                }
+
+                float worldEggDistance = Vector3.Distance(
+                    flarePosition,
+                    eggItem.transform.position);
+
+                if (worldEggDistance < nearestDistance)
+                {
+                    nearestDistance = worldEggDistance;
+                }
+
+                if (worldEggDistance <= RequiredEggRange)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsNestEgg(Item item)
+        {
+            if (item == null || item.gameObject == null)
+            {
+                return false;
+            }
+
+            return string.Equals(
+                NormalizePrefabName(item.gameObject.name),
+                TargetPrefabName,
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string NormalizePrefabName(string objectName)
+        {
+            if (string.IsNullOrWhiteSpace(objectName))
+            {
+                return string.Empty;
+            }
+
+            string normalized = objectName.Trim();
+            const string cloneSuffix = "(Clone)";
+
+            while (normalized.EndsWith(
+                       cloneSuffix,
+                       StringComparison.OrdinalIgnoreCase))
+            {
+                normalized = normalized
+                    .Substring(0, normalized.Length - cloneSuffix.Length)
+                    .Trim();
+            }
+
+            return normalized;
+        }
+
+        private static string GetCharacterName(Character character)
+        {
+            if (character == null)
+            {
+                return "Unknown";
+            }
+
+            if (character.photonView != null &&
+                character.photonView.Owner != null &&
+                !string.IsNullOrEmpty(character.photonView.Owner.NickName))
+            {
+                return character.photonView.Owner.NickName;
+            }
+
+            return character.gameObject.name;
+        }
+
+        /// <summary>
+        /// 현재 씬에서 생성되는 모든 NestEgg를 등록합니다.
+        /// </summary>
+        [HarmonyPatch(typeof(Item), "Awake")]
+        private static class ItemAwakePatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(Item __instance)
+            {
+                RegisterNestEgg(__instance);
+            }
+        }
+
+        /// <summary>
+        /// 조명탄의 실제 네트워크 점화 RPC가 전송되기 직전에 조건을 검사합니다.
+        ///
+        /// 정상 이외의 장소에서는 원본 PEAK 동작을 그대로 허용합니다.
+        /// 정상에서는 NestEgg가 15 유닛 안에 있어야 SetFlareLitRPC가 전송됩니다.
+        /// </summary>
+        [HarmonyPatch(typeof(Flare), nameof(Flare.LightFlare))]
+        private static class FlareLightFlarePatch
+        {
+            [HarmonyPrepare]
+            private static bool Prepare()
+            {
+                Logger.LogInfo(
+                    LogPrefix +
+                    "PATCH READY: Flare.LightFlare" +
+                    " | RequiredEggRange=" + RequiredEggRange +
+                    " | Developer=" + DeveloperName);
+
+                return true;
+            }
+
+            [HarmonyPrefix]
+            private static bool Prefix(Flare __instance)
+            {
+                if (__instance == null || __instance.item == null)
+                {
+                    return true;
+                }
+
+                // 이미 점화된 조명탄에는 영향을 주지 않습니다.
+                if (__instance
+                    .GetData<BoolItemData>(DataEntryKey.FlareActive)
+                    .Value)
+                {
+                    return true;
+                }
+
+                // 정상 이외 지역에서는 PEAK 원본 조명탄 동작을 유지합니다.
+                if (!IsFlareAtPeak(__instance))
+                {
+                    return true;
+                }
+
+                float nearestDistance;
+                if (IsNestEggInFlareRange(__instance, out nearestDistance))
+                {
+                    Logger.LogInfo(
+                        LogPrefix +
+                        "Summit flare lighting allowed." +
+                        " | EggDistance=" + nearestDistance.ToString("F2") +
+                        " | Flare=" + __instance.gameObject.name);
+
+                    return true;
+                }
+
+                Character interactor = __instance.item.holderCharacter;
+                string playerName = GetCharacterName(interactor);
+                string distanceText = float.IsPositiveInfinity(nearestDistance)
+                    ? "No NestEgg found"
+                    : nearestDistance.ToString("F2");
+
+                Logger.LogWarning(
+                    LogPrefix +
+                    "Summit flare lighting blocked. " +
+                    RequirementText +
+                    " | Player=" + playerName +
+                    " | NearestEggDistance=" + distanceText +
+                    " | RequiredRange=" + RequiredEggRange +
+                    " | Flare=" + __instance.gameObject.name);
+
+                if (GUIManager.instance != null)
+                {
+                    GUIManager.instance.UpdateItemPrompts();
+                }
+
+                // 원본 LightFlare 실행을 막아 SetFlareLitRPC 전송을 차단합니다.
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// NestEgg가 파괴되거나 씬에서 제거될 때 활성 달걀 목록에서 제거합니다.
+    /// </summary>
+    [DisallowMultipleComponent]
+    public sealed class WithEgginPEAKTracker : MonoBehaviour
+    {
+        private Item trackedItem;
+
+        public void Initialize(Item item)
+        {
+            trackedItem = item;
+        }
+
+        private void OnDestroy()
+        {
+            WithEgginPEAK.UnregisterNestEgg(trackedItem);
+            trackedItem = null;
+        }
+    }
+}
