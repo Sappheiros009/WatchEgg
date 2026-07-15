@@ -1,0 +1,339 @@
+using BepInEx.Logging;
+using HarmonyLib;
+using UnityEngine;
+
+namespace Sapphire009.WatchEgg
+{
+    /// <summary>
+    /// 로컬 플레이어가 NestEgg를 들고 있는 동안
+    /// Timer.cs의 남은 시간을 화면 하단 중앙에 표시합니다.
+    ///
+    /// 표시 내용:
+    /// - 20초 실시간 숫자 카운트다운
+    /// - 남은 시간을 나타내는 가로 게이지
+    /// - 5초 이하 주황색 경고
+    /// - 2초 이하 빨간색 긴급 경고
+    ///
+    /// Developer: Sapphire009
+    /// File: TimerUI.cs
+    /// </summary>
+    [DisallowMultipleComponent]
+    public sealed class TimerUI : MonoBehaviour
+    {
+        public const string DeveloperName = "Sapphire009";
+
+        private const string LogPrefix = "[TimerUI] ";
+
+        private const float ReferenceScreenHeight = 1080f;
+        private const float ReferenceWidth = 430f;
+        private const float ReferenceHeight = 82f;
+        private const float ReferenceBottomMargin = 170f;
+
+        private const float ReferenceBarHorizontalPadding = 22f;
+        private const float ReferenceBarBottomPadding = 13f;
+        private const float ReferenceBarHeight = 12f;
+
+        private const float WarningStartRemainingTime = 5f;
+        private const float DangerStartRemainingTime = 2f;
+
+        private static readonly Color BackgroundColor =
+            new Color(0f, 0f, 0f, 0.68f);
+
+        private static readonly Color BarBackgroundColor =
+            new Color(0f, 0f, 0f, 0.82f);
+
+        private static readonly Color NormalBarColor =
+            new Color(0.35f, 0.88f, 1f, 1f);
+
+        private static readonly Color WarningBarColor =
+            new Color(1f, 0.63f, 0.12f, 1f);
+
+        private static readonly Color DangerBarColor =
+            new Color(1f, 0.18f, 0.12f, 1f);
+
+        private static readonly ManualLogSource Logger =
+            BepInEx.Logging.Logger.CreateLogSource("WatchEgg.TimerUI");
+
+        private static TimerUI instance;
+
+        private GUIStyle timerTextStyle;
+        private GUIStyle shadowTextStyle;
+        private int cachedFontSize = -1;
+
+        private Item currentEgg;
+        private Timer currentTimer;
+
+        private void Awake()
+        {
+            if (instance != null && instance != this)
+            {
+                Destroy(gameObject);
+                return;
+            }
+
+            instance = this;
+            DontDestroyOnLoad(gameObject);
+
+            Logger.LogInfo(LogPrefix + "NestEgg timer UI created.");
+        }
+
+        private void OnDestroy()
+        {
+            if (instance == this)
+            {
+                instance = null;
+            }
+        }
+
+        private void OnGUI()
+        {
+            if (Event.current != null &&
+                Event.current.type != EventType.Repaint)
+            {
+                return;
+            }
+
+            if (!TryGetHeldEggTimer(out Timer timer))
+            {
+                return;
+            }
+
+            PrepareStyles();
+            DrawTimer(timer);
+        }
+
+        /// <summary>
+        /// 로컬 플레이어가 현재 직접 들고 있는 NestEgg와
+        /// 그 달걀에 부착된 Timer를 가져옵니다.
+        /// </summary>
+        private bool TryGetHeldEggTimer(out Timer timer)
+        {
+            timer = null;
+
+            Character localCharacter = Character.localCharacter;
+            if (localCharacter == null ||
+                localCharacter.data == null ||
+                !localCharacter.IsLocal)
+            {
+                ClearCachedEgg();
+                return false;
+            }
+
+            Item heldItem = localCharacter.data.currentItem;
+            if (heldItem == null ||
+                heldItem.itemState != ItemState.Held ||
+                !Timer.IsNestEgg(heldItem))
+            {
+                ClearCachedEgg();
+                return false;
+            }
+
+            if (currentEgg != heldItem || currentTimer == null)
+            {
+                currentEgg = heldItem;
+                currentTimer = heldItem.GetComponent<Timer>();
+            }
+
+            if (currentTimer == null)
+            {
+                return false;
+            }
+
+            timer = currentTimer;
+            return true;
+        }
+
+        private void ClearCachedEgg()
+        {
+            currentEgg = null;
+            currentTimer = null;
+        }
+
+        /// <summary>
+        /// 남은 시간 숫자와 가로 게이지를 화면에 그립니다.
+        /// CountUI보다 위쪽에 배치하여 서로 겹치지 않게 합니다.
+        /// </summary>
+        private void DrawTimer(Timer timer)
+        {
+            float screenScale = Mathf.Clamp(
+                Screen.height / ReferenceScreenHeight,
+                0.75f,
+                1.5f);
+
+            float width = ReferenceWidth * screenScale;
+            float height = ReferenceHeight * screenScale;
+
+            float x = (Screen.width - width) * 0.5f;
+            float y = Screen.height
+                - (ReferenceBottomMargin * screenScale)
+                - height;
+
+            Rect backgroundRect = new Rect(x, y, width, height);
+
+            Color previousColor = GUI.color;
+
+            GUI.color = BackgroundColor;
+            GUI.DrawTexture(backgroundRect, Texture2D.whiteTexture);
+
+            float remainingTime = Mathf.Clamp(
+                timer.RemainingTime,
+                0f,
+                Timer.MaximumHoldTime);
+
+            float remainingRatio = Timer.MaximumHoldTime > 0f
+                ? remainingTime / Timer.MaximumHoldTime
+                : 0f;
+
+            string timerText =
+                "AUTO DROP IN : " + remainingTime.ToString("0.0") + "s";
+
+            Rect textRect = new Rect(
+                backgroundRect.x,
+                backgroundRect.y + 3f * screenScale,
+                backgroundRect.width,
+                backgroundRect.height - 20f * screenScale);
+
+            float shadowOffset = 2f * screenScale;
+            Rect shadowRect = new Rect(
+                textRect.x + shadowOffset,
+                textRect.y + shadowOffset,
+                textRect.width,
+                textRect.height);
+
+            shadowTextStyle.normal.textColor =
+                new Color(0f, 0f, 0f, 0.95f);
+
+            timerTextStyle.normal.textColor =
+                GetTimerTextColor(remainingTime);
+
+            GUI.color = Color.white;
+            GUI.Label(shadowRect, timerText, shadowTextStyle);
+            GUI.Label(textRect, timerText, timerTextStyle);
+
+            float horizontalPadding =
+                ReferenceBarHorizontalPadding * screenScale;
+
+            float barHeight = ReferenceBarHeight * screenScale;
+
+            Rect barBackgroundRect = new Rect(
+                backgroundRect.x + horizontalPadding,
+                backgroundRect.yMax
+                    - (ReferenceBarBottomPadding * screenScale)
+                    - barHeight,
+                backgroundRect.width - horizontalPadding * 2f,
+                barHeight);
+
+            GUI.color = BarBackgroundColor;
+            GUI.DrawTexture(barBackgroundRect, Texture2D.whiteTexture);
+
+            Rect barFillRect = new Rect(
+                barBackgroundRect.x,
+                barBackgroundRect.y,
+                barBackgroundRect.width * remainingRatio,
+                barBackgroundRect.height);
+
+            GUI.color = GetBarColor(remainingTime);
+            GUI.DrawTexture(barFillRect, Texture2D.whiteTexture);
+
+            GUI.color = previousColor;
+        }
+
+        private static Color GetTimerTextColor(float remainingTime)
+        {
+            if (remainingTime <= DangerStartRemainingTime)
+            {
+                return DangerBarColor;
+            }
+
+            if (remainingTime <= WarningStartRemainingTime)
+            {
+                return WarningBarColor;
+            }
+
+            return Color.white;
+        }
+
+        private static Color GetBarColor(float remainingTime)
+        {
+            if (remainingTime <= DangerStartRemainingTime)
+            {
+                return DangerBarColor;
+            }
+
+            if (remainingTime <= WarningStartRemainingTime)
+            {
+                return WarningBarColor;
+            }
+
+            return NormalBarColor;
+        }
+
+        /// <summary>
+        /// 현재 해상도에 맞는 GUI 스타일을 준비합니다.
+        /// </summary>
+        private void PrepareStyles()
+        {
+            int fontSize = Mathf.RoundToInt(
+                Mathf.Clamp(
+                    Screen.height / ReferenceScreenHeight * 28f,
+                    20f,
+                    38f));
+
+            if (timerTextStyle != null &&
+                shadowTextStyle != null &&
+                cachedFontSize == fontSize)
+            {
+                return;
+            }
+
+            cachedFontSize = fontSize;
+
+            timerTextStyle = new GUIStyle(GUI.skin.label);
+            timerTextStyle.alignment = TextAnchor.MiddleCenter;
+            timerTextStyle.fontSize = fontSize;
+            timerTextStyle.fontStyle = FontStyle.Bold;
+            timerTextStyle.wordWrap = false;
+            timerTextStyle.clipping = TextClipping.Overflow;
+            timerTextStyle.normal.textColor = Color.white;
+
+            shadowTextStyle = new GUIStyle(timerTextStyle);
+            shadowTextStyle.normal.textColor =
+                new Color(0f, 0f, 0f, 0.95f);
+        }
+
+        /// <summary>
+        /// TimerUI 오브젝트가 존재하지 않을 때 한 번만 생성합니다.
+        /// </summary>
+        private static void EnsureTimerUIExists()
+        {
+            if (instance != null)
+            {
+                return;
+            }
+
+            GameObject timerUIObject =
+                new GameObject("WatchEgg_NestEgg_TimerUI");
+
+            timerUIObject.AddComponent<TimerUI>();
+        }
+
+        /// <summary>
+        /// NestEgg가 생성될 때 TimerUI를 자동 생성합니다.
+        /// WatchEgg.cs를 수정하지 않아도 Harmony.PatchAll()로 등록됩니다.
+        /// </summary>
+        [HarmonyPatch(typeof(Item), "Awake")]
+        private static class ItemAwakePatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(Item __instance)
+            {
+                if (!Timer.IsNestEgg(__instance))
+                {
+                    return;
+                }
+
+                EnsureTimerUIExists();
+            }
+        }
+    }
+}
